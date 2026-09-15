@@ -1,0 +1,78 @@
+version: '3.8'
+
+# ============================================================
+# Luminus N8N Self-Hosted Automation Infrastructure
+# ============================================================
+# USAGE:
+#   1. Copy this file to your VPS
+#   2. Edit the N8N_BASIC_AUTH_PASSWORD below
+#   3. Run: docker compose up -d
+#   4. Access at http://your-vps-ip:5678
+#   5. Set up your HTTPS reverse proxy (nginx/caddy) pointing
+#      to port 5678, then update your .env webhook URLs.
+# ============================================================
+
+volumes:
+  n8n_data:
+  postgres_data:
+
+services:
+
+  # ----------------------------------------------------------
+  # PostgreSQL — persistent storage for N8N workflows
+  # ----------------------------------------------------------
+  postgres:
+    image: postgres:15-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: n8n
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-change_me_in_production}
+      POSTGRES_DB: n8n
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    healthcheck:
+      test: ['CMD-SHELL', 'pg_isready -U n8n']
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  # ----------------------------------------------------------
+  # N8N — Workflow automation engine
+  # ----------------------------------------------------------
+  n8n:
+    image: n8nio/n8n:latest
+    restart: unless-stopped
+    ports:
+      - '5678:5678'
+    environment:
+      # --- Database ---
+      DB_TYPE: postgresdb
+      DB_POSTGRESDB_HOST: postgres
+      DB_POSTGRESDB_PORT: 5432
+      DB_POSTGRESDB_DATABASE: n8n
+      DB_POSTGRESDB_USER: n8n
+      DB_POSTGRESDB_PASSWORD: ${POSTGRES_PASSWORD:-change_me_in_production}
+
+      # --- Auth (change these!) ---
+      N8N_BASIC_AUTH_ACTIVE: 'true'
+      N8N_BASIC_AUTH_USER: ${N8N_ADMIN_USER:-admin}
+      N8N_BASIC_AUTH_PASSWORD: ${N8N_ADMIN_PASSWORD:-change_me_in_production}
+
+      # --- Public URL (set to your domain after adding HTTPS) ---
+      N8N_HOST: ${N8N_HOST:-localhost}
+      N8N_PORT: 5678
+      N8N_PROTOCOL: ${N8N_PROTOCOL:-http}
+      WEBHOOK_URL: ${N8N_WEBHOOK_BASE_URL:-http://localhost:5678}
+
+      # --- Timezone ---
+      GENERIC_TIMEZONE: America/New_York
+
+      # --- Limits ---
+      EXECUTIONS_DATA_PRUNE: 'true'
+      EXECUTIONS_DATA_MAX_AGE: 336   # keep 2 weeks of logs
+
+    volumes:
+      - n8n_data:/home/node/.n8n
+    depends_on:
+      postgres:
+        condition: service_healthy

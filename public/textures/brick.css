@@ -1,0 +1,7 @@
+/* Local brick texture - no CORS */
+.bg-brick-local {
+  background-color: #1a0e0e;
+  background-image: 
+    repeating-linear-gradient(45deg, transparent, transparent 35px, rgba(42, 26, 26, 0.5) 35px, rgba(42, 26, 26, 0.5) 70px),
+    repeating-linear-gradient(-45deg, transparent, transparent 35px, rgba(36, 20, 20, 0.5) 35px, rgba(36, 20, 20, 0.5) 70px);
+}

@@ -1,0 +1,30 @@
+{
+  "date": "2026-09-07",
+  "total": 23,
+  "perSource": [
+    {
+      "alias": "Brown",
+      "count": 8,
+      "duplicate": 0
+    },
+    {
+      "alias": "Black",
+      "count": 4,
+      "duplicate": 0
+    },
+    {
+      "alias": "Blue",
+      "count": 2,
+      "duplicate": 0
+    },
+    {
+      "alias": "White",
+      "count": 9,
+      "duplicate": 0
+    }
+  ],
+  "incomplete": false,
+  "killed": false,
+  "ok": true,
+  "updatedAt": "2026-09-15T09:50:14.270Z"
+}

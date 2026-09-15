@@ -1,0 +1,44 @@
+{
+  "name": "luminus-proposal-system",
+  "private": true,
+  "version": "4.0.0",
+  "type": "module",
+  "scripts": {
+    "dev": "concurrently \"node server.js\" \"vite\"",
+    "dev:frontend": "vite",
+    "dev:api": "node server.js",
+    "build": "vite build",
+    "preview": "vite preview"
+  },
+  "dependencies": {
+    "@supabase/supabase-js": "^2.39.3",
+    "axios": "^1.6.5",
+    "exceljs": "^4.4.0",
+    "html2canvas": "^1.4.1",
+    "imagetracerjs": "1.2.6",
+    "imapflow": "^2.0.2",
+    "jspdf": "^2.5.2",
+    "mailparser": "^3.9.24",
+    "multer": "^2.2.0",
+    "nodemailer": "^8.0.5",
+    "pinia": "^2.1.7",
+    "puppeteer": "^25.5.0",
+    "replicate": "^0.25.2",
+    "stripe": "^22.4.0",
+    "vue": "^3.4.15",
+    "vue-router": "^4.2.5"
+  },
+  "devDependencies": {
+    "@vitejs/plugin-vue": "^5.0.3",
+    "autoprefixer": "^10.4.17",
+    "concurrently": "^8.2.2",
+    "cors": "^2.8.5",
+    "dotenv": "^16.4.1",
+    "express": "^4.18.2",
+    "form-data": "^4.0.0",
+    "node-fetch": "^3.3.2",
+    "postcss": "^8.4.33",
+    "tailwindcss": "^3.4.1",
+    "vite": "^5.0.11"
+  }
+}

@@ -3,7 +3,7 @@
     <header class="crm-top">
       <div class="crm-brand"><span class="dot"></span> Luminus CRM</div>
       <nav class="crm-nav">
-        <router-link :to="{ name: 'crm' }">Inbox</router-link>
+        <router-link :to="{ name: 'crm' }">Inbox<span v-if="unreadCount" class="nav-unread-badge">{{ unreadCount }}</span></router-link>
         <router-link :to="{ name: 'crm-leads' }">Leads</router-link>
         <router-link :to="{ name: 'crm-responses' }">Responses</router-link>
         <router-link :to="{ name: 'crm-pipeline' }">Pipeline</router-link>
@@ -110,7 +110,13 @@
                 <td class="muted">{{ r.contactEmail || '—' }}</td>
                 <td class="muted small">{{ r.daysSince }} day{{ r.daysSince === 1 ? '' : 's' }}</td>
                 <td class="right">
-                  <router-link v-if="r.threadId" :to="{ name: 'crm', query: { thread: r.threadId } }" class="btn-sm">Follow Up</router-link>
+                  <router-link v-if="r.threadId" :to="{ name: 'crm', query: { thread: r.threadId } }" class="btn-sm">Open Thread</router-link>
+                  <button
+                    class="btn-sm"
+                    style="margin-left:6px"
+                    :disabled="sendingStale.has(r.leadId) || sentStale.has(r.leadId)"
+                    @click="sendFollowup(r.leadId)"
+                  >{{ sentStale.has(r.leadId) ? 'Sent ✓' : sendingStale.has(r.leadId) ? 'Sending…' : 'Send Follow-up' }}</button>
                   <button class="btn-sm" @click="dismissStale(r.leadId)" style="margin-left:6px">Dismiss</button>
                 </td>
               </tr>
@@ -252,8 +258,10 @@
 
 <script setup>
 import { useCrmThemeStore } from '@/stores/crmThemeStore'
+import { useInboxUnread } from '@/composables/useInboxUnread'
 
 const crmTheme = useCrmThemeStore()
+const { unreadCount } = useInboxUnread()
 import { ref, reactive, onMounted } from 'vue'
 import { useAdminAuthStore } from '@/stores/adminAuthStore'
 import { employeeNameHeader } from '@/services/crmActivity'
@@ -456,6 +464,27 @@ async function dismissStale(leadId) {
     await loadSummary()
   } catch (e) {
     alert(e.message || 'Could not dismiss')
+  }
+}
+
+// Sets, not plain booleans keyed by id, so re-rendering the row list (e.g. after a
+// search) doesn't need per-row state threaded through staleRows itself. Reassigned
+// (not mutated in place) on every change since Vue's ref() reactivity doesn't track
+// in-place Set mutations.
+const sendingStale = ref(new Set())
+const sentStale = ref(new Set())
+async function sendFollowup(leadId) {
+  if (sendingStale.value.has(leadId) || sentStale.value.has(leadId)) return
+  sendingStale.value = new Set(sendingStale.value).add(leadId)
+  try {
+    await api(`/${leadId}/send-followup`, { method: 'POST' })
+    sentStale.value = new Set(sentStale.value).add(leadId)
+  } catch (e) {
+    alert(e.message || 'Could not send the follow-up email')
+  } finally {
+    const next = new Set(sendingStale.value)
+    next.delete(leadId)
+    sendingStale.value = next
   }
 }
 

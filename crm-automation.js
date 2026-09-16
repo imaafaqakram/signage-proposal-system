@@ -16,8 +16,11 @@
 //   - a lightweight lead search, so a lead can be added to the DNC list without hunting
 //     for them in the Proposal System's Saved Leads panel first
 //   - a "who actually got a follow-up email" list (leads.follow_up_count > 0)
-//   - a "gone quiet" list: leads at stage='responded' with no activity in 3+ days,
-//     surfaced for a human decision only — never auto-actioned
+//   - a "gone quiet" list: leads that have replied at least once (stage
+//     'responded' or 'negotiating') the LEAD hasn't replied to again in 3+
+//     days, surfaced for a human decision only — never auto-actioned (our own
+//     follow-up sends don't count as the lead being "active" — see the
+//     STALE_STAGES/STALE_DAYS comments below and migration 015)
 //
 // Every route here reads/writes ONLY the `leads` table (real CRM leads that the
 // follow-up drip actually emails). It never touches `crm_airtable_projects` — the
@@ -28,24 +31,60 @@
 // Self-contained like every other CRM module: only touches crm-db.js's shared Supabase
 // client, and only ever writes the single follow_up_stopped_at column on `leads`.
 import express from 'express'
-import { _crmSupabase as supabase, logCrmActivity } from './crm-db.js'
+import { _crmSupabase as supabase, logCrmActivity, markLeadContacted } from './crm-db.js'
 
 const LEAD_COLS = 'id, client_name, contact_email, email_sent_at, follow_up_stopped_at, follow_up_count, follow_up_last_sent_at'
 
-// A lead that replied sits at stage='responded' — if nothing has happened on it
-// (from either side) for this many days, it's gone quiet and needs a human
-// decision, not an automatic action.
+// For the manual "send now" button on a Gone Quiet row — calls the SAME internal
+// endpoint scripts/send-followups.js hits, on the same server process, so the send
+// reuses the exact SMTP path/template/CC rule rather than a second, divergent one.
+const INTERNAL_BASE_URL = `http://localhost:${process.env.PORT || 3001}`
+
+// A lead that replied sits at stage='responded' — if the LEAD hasn't replied
+// again in this many days, it's gone quiet and needs a human decision, not an
+// automatic action. Measured against last_inbound_activity_at specifically
+// (migration 015), not last_activity_at — last_activity_at is bumped on every
+// outbound send too (our own follow-ups), so it never went stale for a lead we
+// kept automatically following up with, no matter how long THEY stayed silent.
+// last_inbound_activity_at only moves when the lead actually replies.
 const STALE_DAYS = 3
+
+// A lead can go quiet at any point after it first engages, not only while it's
+// still sitting exactly at stage='responded' — a lead that progressed further
+// (e.g. 'negotiating') has replied at least once by definition (rank order:
+// new < contacted < responded < negotiating < won/lost) and can still stop
+// answering mid-negotiation, arguably the case that most needs a human decision.
+// Filtering on stage='responded' alone made every lead that ever advanced past
+// that stage permanently invisible to this panel even if they'd gone silent for
+// weeks. 'won'/'lost' are excluded since those are already closed — no decision
+// needed. 'new'/'contacted' are excluded too: those leads haven't replied yet at
+// all, which is a different situation ("never responded") from "went quiet".
+const STALE_STAGES = ['responded', 'negotiating']
 
 async function fetchStaleResponded(term) {
   const cutoff = new Date(Date.now() - STALE_DAYS * 86400000).toISOString()
+  let activityCol = 'last_inbound_activity_at'
   let { data: statusRows, error } = await supabase
     .from('crm_lead_status')
-    .select('lead_id, last_activity_at, stale_dismissed_at')
-    .eq('stage', 'responded')
-    .lt('last_activity_at', cutoff)
-    .order('last_activity_at', { ascending: true })
+    .select('lead_id, last_activity_at, last_inbound_activity_at, stale_dismissed_at')
+    .in('stage', STALE_STAGES)
+    .lt(activityCol, cutoff)
+    .order(activityCol, { ascending: true })
     .limit(500)
+  if (error && /last_inbound_activity_at/i.test(error.message || '')) {
+    // Migration 015 (crm_lead_status.last_inbound_activity_at) hasn't been run yet —
+    // fall back to the old (imprecise, "either side" — see migration 015's comment
+    // for why that's wrong) column so the card still works. Self-heals with no
+    // further deploy once the column exists.
+    activityCol = 'last_activity_at'
+    ;({ data: statusRows, error } = await supabase
+      .from('crm_lead_status')
+      .select('lead_id, last_activity_at, stale_dismissed_at')
+      .in('stage', STALE_STAGES)
+      .lt(activityCol, cutoff)
+      .order(activityCol, { ascending: true })
+      .limit(500))
+  }
   if (error && /stale_dismissed_at/i.test(error.message || '')) {
     // Migration 011 (crm_lead_status.stale_dismissed_at) hasn't been run yet —
     // degrade instead of breaking the whole card: everything reads as "not
@@ -53,19 +92,20 @@ async function fetchStaleResponded(term) {
     // further deploy once the column exists.
     ;({ data: statusRows, error } = await supabase
       .from('crm_lead_status')
-      .select('lead_id, last_activity_at')
+      .select(`lead_id, ${activityCol}`)
       .eq('stage', 'responded')
-      .lt('last_activity_at', cutoff)
-      .order('last_activity_at', { ascending: true })
+      .lt(activityCol, cutoff)
+      .order(activityCol, { ascending: true })
       .limit(500))
   }
   if (error) throw error
 
-  // stale_dismissed_at is compared against last_activity_at in JS, not the DB query,
-  // since PostgREST's simple filter syntax can't compare one column to another —
-  // dismissing just quiets a lead until its NEXT real activity, not permanently.
+  // stale_dismissed_at is compared against the activity column in JS, not the DB
+  // query, since PostgREST's simple filter syntax can't compare one column to
+  // another — dismissing just quiets a lead until its NEXT real activity, not
+  // permanently.
   const stale = (statusRows || []).filter(
-    (r) => !r.stale_dismissed_at || new Date(r.stale_dismissed_at) < new Date(r.last_activity_at)
+    (r) => !r.stale_dismissed_at || new Date(r.stale_dismissed_at) < new Date(r[activityCol])
   )
   if (!stale.length) return []
 
@@ -90,8 +130,8 @@ async function fetchStaleResponded(term) {
       leadId: r.lead_id,
       clientName: lead.client_name || null,
       contactEmail: lead.contact_email || null,
-      lastActivityAt: r.last_activity_at,
-      daysSince: Math.floor((Date.now() - new Date(r.last_activity_at).getTime()) / 86400000),
+      lastActivityAt: r[activityCol],
+      daysSince: Math.floor((Date.now() - new Date(r[activityCol]).getTime()) / 86400000),
       threadId: threadMap.get(r.lead_id) || null
     }
   })
@@ -229,9 +269,10 @@ export function createCrmAutomationRouter({ requireAuth, requireAdmin } = {}) {
     }
   })
 
-  // GET /stale-responded?limit=&offset=&q= — leads that replied but have had zero
-  // activity (from either side) in STALE_DAYS days. Never auto-actioned — this is
-  // purely "flag it for a human to decide," per the owner's explicit instruction.
+  // GET /stale-responded?limit=&offset=&q= — leads that replied at least once
+  // (STALE_STAGES) but haven't replied again in STALE_DAYS days. Never
+  // auto-actioned — this is purely "flag it for a human to decide," per the
+  // owner's explicit instruction.
   router.get('/stale-responded', auth, async (req, res) => {
     try {
       const limit = Math.min(200, Math.max(1, parseInt(req.query.limit, 10) || 50))
@@ -266,6 +307,60 @@ export function createCrmAutomationRouter({ requireAuth, requireAdmin } = {}) {
       res.json({ ok: true })
     } catch (err) {
       console.error('[crm-automation] dismiss-stale', err)
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  // POST /:id/send-followup — one-click "send the general follow-up email" from a
+  // Gone Quiet row. Deliberately still a human decision (the button has to be
+  // clicked), just skipping the trip into the Inbox to compose one by hand for the
+  // common case where the standard reminder is exactly what's needed. Reuses the
+  // exact same send path (SMTP transporter, HTML template, CC rule) as the
+  // automated drip by calling the same internal endpoint — never a second,
+  // divergent copy of that template. Also marks the lead "contacted" in
+  // crm_lead_status so Leads/Pipeline's "last activity" reflects the send (this is
+  // last_activity_at, the "any touch" field — separate from last_inbound_activity_at,
+  // which only ever moves on a genuine reply, so sending this does NOT clear the
+  // lead off the Gone Quiet list; it's still up to the lead to actually respond).
+  router.post('/:id/send-followup', auth, jsonBody, async (req, res) => {
+    try {
+      const id = Number(req.params.id)
+      if (!Number.isFinite(id)) return res.status(400).json({ error: 'bad id' })
+      const { data: lead, error: leadErr } = await supabase
+        .from('leads')
+        .select('id, client_name, contact_email, email_sent_at, follow_up_count')
+        .eq('id', id)
+        .maybeSingle()
+      if (leadErr) throw leadErr
+      if (!lead) return res.status(404).json({ error: 'Lead not found' })
+      if (!lead.contact_email) return res.status(400).json({ error: 'This lead has no contact email on file' })
+
+      const followUpNumber = (lead.follow_up_count || 0) + 1
+      const daysSinceOriginal = lead.email_sent_at
+        ? Math.round((Date.now() - new Date(lead.email_sent_at).getTime()) / 86400000)
+        : 0
+
+      const sendRes = await fetch(`${INTERNAL_BASE_URL}/api/internal/send-followup-email`, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          leadId: lead.id,
+          clientName: lead.client_name,
+          clientEmail: lead.contact_email,
+          followUpNumber,
+          daysSinceOriginal
+        })
+      })
+      const sendResult = await sendRes.json().catch(() => ({}))
+      if (!sendRes.ok) return res.status(sendRes.status).json({ error: sendResult.error || sendResult.details || 'Send failed' })
+
+      await markLeadContacted(id).catch((e) => console.warn('[crm-automation] send-followup markLeadContacted failed:', e.message))
+
+      const name = (req.headers['x-employee-name'] || '').toString().trim().slice(0, 80) || null
+      logCrmActivity({ employeeName: name, action: 'stale.send-followup', entityType: 'lead', entityId: id })
+      res.json({ ok: true, followUpNumber })
+    } catch (err) {
+      console.error('[crm-automation] send-followup', err)
       res.status(500).json({ error: err.message })
     }
   })

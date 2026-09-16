@@ -16,8 +16,10 @@
 -->
 <script setup>
 import { useCrmThemeStore } from '@/stores/crmThemeStore'
+import { useInboxUnread } from '@/composables/useInboxUnread'
 
 const crmTheme = useCrmThemeStore()
+const { unreadCount } = useInboxUnread()
 import { ref, onMounted, onBeforeUnmount } from 'vue'
 
 /* ------------------------------------------------------------------ auth + fetch */
@@ -198,7 +200,7 @@ function fmtRel(v) {
     <header class="crm-top">
       <div class="crm-brand"><span class="dot"></span> Luminus CRM</div>
       <nav class="crm-nav">
-        <router-link :to="{ name: 'crm' }">Inbox</router-link>
+        <router-link :to="{ name: 'crm' }">Inbox<span v-if="unreadCount" class="nav-unread-badge">{{ unreadCount }}</span></router-link>
         <router-link :to="{ name: 'crm-leads' }">Leads</router-link>
         <router-link :to="{ name: 'crm-responses' }">Responses</router-link>
         <router-link :to="{ name: 'crm-pipeline' }">Pipeline</router-link>

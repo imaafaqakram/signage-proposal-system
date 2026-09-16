@@ -206,7 +206,12 @@ export async function markLeadContacted(leadId, at) {
 
 export async function markLeadResponded(leadId, at) {
   const when = at || new Date().toISOString()
-  await upsertLeadStatus(leadId, { stage: 'responded', first_response_at: when })
+  // last_inbound_activity_at is deliberately separate from last_activity_at (which
+  // upsertLeadStatus always bumps to "now" on every call, including our own outbound
+  // sends via markLeadContacted). Only genuine inbound replies touch this field, so
+  // the "Needs a Decision — Gone Quiet" cutoff (crm-automation.js) measures how long
+  // the LEAD has been silent, not how recently we last emailed them.
+  await upsertLeadStatus(leadId, { stage: 'responded', first_response_at: when, last_inbound_activity_at: when })
 }
 
 /**

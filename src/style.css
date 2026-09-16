@@ -843,3 +843,26 @@ html.theme-light {
   --crm-badge-bg: #eef0f3;
   --crm-modal-overlay: rgba(15, 23, 42, .35);
 }
+
+/* Unread-mail badge on the "Inbox" nav link — shared by every CRM view (each view
+   currently duplicates its own nav markup rather than using one shared component;
+   this rule is the one thing about it that's centralized, so the badge always looks
+   identical regardless of which page's copy of the nav renders it). Uses the
+   existing --crm-danger token rather than a new hardcoded color so it stays in sync
+   with whichever theme (Light/Pro) is active. */
+.nav-unread-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 15px;
+  height: 15px;
+  padding: 0 4px;
+  margin-left: 5px;
+  border-radius: 999px;
+  background: var(--crm-danger);
+  color: #fff;
+  font-size: 10px;
+  font-weight: 800;
+  line-height: 1;
+  vertical-align: middle;
+}

@@ -21,6 +21,18 @@
         <i class="fas" :class="crmTheme.theme === 'pro' ? 'fa-sun' : 'fa-moon'"></i>
       </button>
       <CrmUserChip />
+      <button
+        v-if="adminAuth.isAuthenticated && pace"
+        class="master-switch"
+        :class="{ on: pace.sendingEnabled }"
+        type="button"
+        :disabled="switchBusy || migrationPending"
+        :aria-pressed="pace.sendingEnabled"
+        :title="pace.sendingEnabled ? 'Sending is ON — click to turn off' : 'Sending is OFF — nothing will be emailed'"
+        @click="toggleSending"
+      >
+        <span class="ms-dot"></span>{{ pace.sendingEnabled ? 'Sending ON' : 'Sending OFF' }}
+      </button>
       <div class="crm-counts" v-if="adminAuth.isAuthenticated">
         <span>{{ activeBroadcasts }} sending now</span>
       </div>
@@ -65,6 +77,11 @@
           <i class="fas fa-triangle-exclamation"></i>
           <div><strong>Automatic sending is switched off on this server.</strong>
             Announcements can be queued, but nothing is emailed until <code>CRM_BROADCAST_WORKER=true</code> is set and the server restarted.</div>
+        </div>
+        <div v-else-if="pace && !pace.sendingEnabled" class="banner off">
+          <i class="fas fa-power-off"></i>
+          <div><strong>Sending is turned OFF.</strong> Nothing will be emailed to clients — including anything already
+            queued below — until you turn it on with the switch at the top of the page.</div>
         </div>
 
         <!-- COMPOSE -->
@@ -382,9 +399,10 @@ async function sendTest() {
 const sending = ref(false)
 const sendError = ref('')
 const sendDone = ref('')
-const canSend = computed(() => subject.value.trim() && body.value.trim().length >= 5 && selectedList.value.length > 0 && !placeholders.value.length && !migrationPending.value)
+const canSend = computed(() => subject.value.trim() && body.value.trim().length >= 5 && selectedList.value.length > 0 && !placeholders.value.length && !migrationPending.value && !!pace.value?.sendingEnabled)
 const sendHint = computed(() => {
   if (migrationPending.value) return 'Run the database update first.'
+  if (pace.value && !pace.value.sendingEnabled) return 'Sending is off — flip the switch at the top of the page first.'
   if (!subject.value.trim() || body.value.trim().length < 5) return 'Write a subject and a message.'
   if (placeholders.value.length) return 'Replace the [bracketed] parts first.'
   if (!selectedList.value.length) return 'Tick at least one client.'
@@ -415,6 +433,16 @@ const open = ref(null)
 const detail = ref(null)
 const detailLoading = ref(false)
 const activeBroadcasts = computed(() => broadcasts.value.filter((b) => b.status === 'sending').length)
+const switchBusy = ref(false)
+async function toggleSending() {
+  const turningOn = !pace.value?.sendingEnabled
+  if (turningOn && !confirm('Turn ON announcement sending?\n\nAny announcements already queued will start going out immediately, up to 30 per hour.')) return
+  switchBusy.value = true
+  try {
+    const r = await api('/toggle', { method: 'POST', body: { enabled: turningOn } })
+    pace.value = { ...pace.value, sendingEnabled: r.sendingEnabled }
+  } catch (e) { alert(e.message || 'Could not change the switch.') } finally { switchBusy.value = false }
+}
 
 const pct = (b) => (b.total ? Math.min(100, Math.round(((b.sent_count + b.failed_count + b.skipped_count) / b.total) * 100)) : 0)
 const waiting = (b) => Math.max(0, b.total - b.sent_count - b.failed_count - b.skipped_count)
@@ -489,6 +517,12 @@ onBeforeUnmount(() => clearInterval(timer))
 .crm-counts { display: flex; gap: 14px; font-size: 12.5px; font-weight: 700; margin-left: auto; }
 .crm-refresh { background: var(--crm-hover-bg); border: 1px solid var(--crm-border-strong); color: var(--crm-text-soft); width: 32px; height: 32px; border-radius: 6px; cursor: pointer; }
 .crm-refresh:hover { background: var(--crm-hover-bg-strong); }
+.master-switch { display: flex; align-items: center; gap: 7px; background: var(--crm-hover-bg); border: 1px solid var(--crm-border-strong); color: var(--crm-text-muted); height: 32px; padding: 0 13px; border-radius: 16px; cursor: pointer; font: inherit; font-size: 11.5px; font-weight: 800; letter-spacing: .03em; text-transform: uppercase; flex: none; }
+.master-switch:hover:not(:disabled) { border-color: var(--crm-text-muted); }
+.master-switch:disabled { opacity: .6; cursor: default; }
+.master-switch .ms-dot { width: 7px; height: 7px; border-radius: 50%; background: var(--crm-text-dim); flex: none; }
+.master-switch.on { background: var(--crm-success-bg, rgba(34, 197, 94, .14)); border-color: var(--crm-success); color: var(--crm-success); }
+.master-switch.on .ms-dot { background: var(--crm-success); box-shadow: 0 0 6px var(--crm-success); }
 
 .lock-wrap { display: flex; align-items: center; justify-content: center; min-height: calc(100vh - 57px); padding: 40px; }
 .lock-card { background: var(--crm-panel-bg); border: 1px solid var(--crm-border); border-radius: 14px; padding: 40px 44px; text-align: center; max-width: 380px; }
@@ -505,6 +539,8 @@ onBeforeUnmount(() => clearInterval(timer))
 .wrap { max-width: 980px; margin: 0 auto; padding: 22px 18px 60px; display: flex; flex-direction: column; gap: 18px; width: 100%; box-sizing: border-box; }
 .banner { display: flex; gap: 12px; align-items: flex-start; background: var(--crm-warn-bg); border: 1px solid var(--crm-warn-border); color: var(--crm-text-secondary); border-radius: 10px; padding: 12px 16px; font-size: 12.5px; line-height: 1.55; }
 .banner i { color: var(--crm-warn); margin-top: 2px; }
+.banner.off { background: var(--crm-badge-bg); border-color: var(--crm-border-strong); }
+.banner.off i { color: var(--crm-text-muted); }
 code { background: var(--crm-badge-bg); padding: 1px 6px; border-radius: 4px; font-size: 11.5px; }
 
 .card { background: var(--crm-panel-bg); border: 1px solid var(--crm-border); border-radius: 12px; padding: 18px 20px; }

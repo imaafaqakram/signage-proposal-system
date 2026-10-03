@@ -39,6 +39,7 @@ import { createCrmAuth } from './crm-auth.js'
 import { createCrmFxRouter } from './crm-fx.js'
 import { createCrmHistoryRouter } from './crm-audit.js'
 import { createCrmBroadcastRouter, startBroadcastWorker } from './crm-broadcast.js'
+import { reconcileInbox as crmReconcileInbox } from './crm-inbox-reconcile.js'
 import { pollSentFolder as crmPollSentFolder } from './crm-sent-poll.js'
 import { logOutboundEmail as crmLogOutbound, recordAttachment as crmRecordAttachment } from './crm-db.js'
 import { saveLeadVersion, listLeads, listVersions, getVersion, deleteLead, listBatches, getBatchLeads, getLeadsByDate, getLeadByCrmRecordId, markLeadEmailSent, markLeadCrmDate, stopFollowUps, resumeFollowUps, getFollowUpCandidates, recordFollowUpSent } from './db.js'
@@ -91,7 +92,12 @@ const DEFAULT_ADMIN_SETTINGS = {
   followUpIntervalMinDays: 3,
   followUpIntervalMaxDays: 4,
   followUpMaxDurationDays: 120,
-  followUpMaxCount: 30
+  followUpMaxCount: 30,
+  // Master switch for client announcements (crm-broadcast.js) — OFF by default so nothing
+  // is ever emailed until an admin explicitly turns it on from the Announcements page, even
+  // if messages are queued. Separate from CRM_BROADCAST_WORKER (that's ops-level: which
+  // server process is allowed to run the sender at all); this is the everyday on/off switch.
+  crmBroadcastEnabled: false
 }
 
 let adminSettingsCache = null
@@ -458,7 +464,7 @@ app.use('/api/crm/users', crmAuth.usersRouter)
 app.use('/api/crm/fx', createCrmFxRouter({ requireAuth: requireCrmAuth }))
 app.use('/api/crm/history', createCrmHistoryRouter({ requireAuth: requireCrmAuth, requireAdmin: requireCrmAdmin, isAdmin: crmAuth.isAdminRequest }))
 // Client announcements (admin-only; queue + 30-per-hour sender live in crm-broadcast.js).
-app.use('/api/crm/broadcasts', createCrmBroadcastRouter({ requireAuth: requireCrmAdmin, loadAdminSettings }))
+app.use('/api/crm/broadcasts', createCrmBroadcastRouter({ requireAuth: requireCrmAdmin, loadAdminSettings, saveAdminSettings }))
 app.use('/api/crm', createCrmRouter({ requireAuth: requireCrmAuth }))
 app.use('/api/crm/leads', createCrmLeadsRouter({ requireAuth: requireCrmAuth }))
 app.use('/api/crm/stats', createCrmStatsRouter({ requireAuth: requireCrmAuth }))
@@ -2422,6 +2428,20 @@ setTimeout(() => {
     crmPollSentFolder({ days: 3 }).catch((e) => console.warn('⚠️  CRM sent-poll failed:', e.message))
   }, CRM_SENT_POLL_MS)
 }, 30 * 1000)
+
+// CRM: safety net for inbound mail the live n8n feed missed or failed on — mail opened in
+// webmail before n8n saw it, a dropped IMAP connection, an oversized message that timed out.
+// Every 5 min it lists the INBOX headers and imports anything older than 6 min that the CRM
+// lacks (read or unread; see crm-inbox-reconcile.js). OFF unless CRM_INBOX_RECONCILE=true is
+// set in THIS server's .env — staging shares the database, so two of them would race.
+if (process.env.CRM_INBOX_RECONCILE === 'true') {
+  const CRM_RECONCILE_MS = 5 * 60 * 1000
+  const runReconcile = () => crmReconcileInbox({ days: 3 }).catch((e) => console.warn('⚠️  CRM inbox-reconcile failed:', e.message))
+  setTimeout(() => {
+    runReconcile()
+    setInterval(runReconcile, CRM_RECONCILE_MS)
+  }, 75 * 1000)
+}
 
 // CRM client announcements: background sender (30 emails per rolling hour). Off unless
 // CRM_BROADCAST_WORKER=true is set in THIS server's .env — see crm-broadcast.js.

@@ -92,6 +92,14 @@ function getTransport() {
   return transport
 }
 
+// Master on/off switch, stored the same way as every other owner-controlled setting
+// (admin-settings.json via loadAdminSettings/saveAdminSettings). Defaults OFF — see
+// DEFAULT_ADMIN_SETTINGS in server.js. Any read failure also means OFF: fail safe, never
+// fail open into sending client email.
+async function sendingEnabled(loadAdminSettings) {
+  try { return !!(await loadAdminSettings()).crmBroadcastEnabled } catch { return false }
+}
+
 async function senderInfo(loadAdminSettings) {
   let settings = {}
   try { settings = (loadAdminSettings && (await loadAdminSettings())) || {} } catch { /* defaults */ }
@@ -207,6 +215,7 @@ async function deliver(bc, r, sender) {
 
 export async function processQueue({ loadAdminSettings } = {}) {
   if (running || Date.now() < backoffUntil) return
+  if (!(await sendingEnabled(loadAdminSettings))) return // master switch is off — nothing goes out
   running = true
   try {
     const { data: active, error } = await supabase.from('crm_broadcasts').select('*').eq('status', 'sending').order('created_at', { ascending: true })
@@ -325,7 +334,7 @@ async function buildAudience() {
 }
 
 // ───────────────────────── routes ─────────────────────────
-export function createCrmBroadcastRouter({ requireAuth, loadAdminSettings } = {}) {
+export function createCrmBroadcastRouter({ requireAuth, loadAdminSettings, saveAdminSettings } = {}) {
   const router = express.Router()
   const auth = requireAuth || ((req, res, next) => next())
   const jsonBody = express.json({ limit: '2mb' })
@@ -343,8 +352,25 @@ export function createCrmBroadcastRouter({ requireAuth, loadAdminSettings } = {}
     try {
       const attempts = await attemptsInWindow()
       const nextSlotAt = attempts.length >= PER_HOUR ? new Date(new Date(attempts[0].attempted_at).getTime() + WINDOW_MS).toISOString() : null
-      res.json({ perHour: PER_HOUR, usedLastHour: attempts.length, nextSlotAt, workerEnabled: workerOn, dryRun: process.env.CRM_BROADCAST_DRYRUN === 'true', backoffUntil: backoffUntil > Date.now() ? new Date(backoffUntil).toISOString() : null })
+      res.json({
+        perHour: PER_HOUR, usedLastHour: attempts.length, nextSlotAt,
+        sendingEnabled: await sendingEnabled(loadAdminSettings),
+        workerEnabled: workerOn, dryRun: process.env.CRM_BROADCAST_DRYRUN === 'true',
+        backoffUntil: backoffUntil > Date.now() ? new Date(backoffUntil).toISOString() : null
+      })
     } catch (err) { fail(res, err, 'status') }
+  })
+
+  // POST /toggle — the master on/off switch. Turning it off does not cancel or lose
+  // anything already queued; those recipients just wait until it's turned back on (same
+  // as a per-announcement pause, but for the whole feature at once).
+  router.post('/toggle', jsonBody, async (req, res) => {
+    try {
+      const enabled = !!req.body?.enabled
+      await saveAdminSettings({ crmBroadcastEnabled: enabled })
+      logEvent(req, { action: 'broadcast.toggle', entityType: 'settings', entityId: 'crmBroadcastEnabled', meta: { detail: enabled ? 'Turned announcements sending ON' : 'Turned announcements sending OFF' } })
+      res.json({ ok: true, sendingEnabled: enabled })
+    } catch (err) { fail(res, err, 'toggle') }
   })
 
   // GET /audience — who could receive it.

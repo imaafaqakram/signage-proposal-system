@@ -2,7 +2,10 @@
 // Deliberately self-contained: its own Supabase client (same config as db.js) so
 // nothing here can affect the proposal system's persistence path. Schema:
 // supabase/migrations/005_crm_tables.sql
+import fs from 'node:fs'
+import path from 'node:path'
 import { createClient } from '@supabase/supabase-js'
+import { normalizeMessageId, idKey, slimHtml, clipText } from './crm-mail-utils.js'
 
 const fetchWithTimeout = (url, options = {}) =>
   fetch(url, { ...options, signal: AbortSignal.timeout(15000) })
@@ -101,7 +104,7 @@ async function findThreadByInReplyTo(inReplyTo) {
   const { data, error } = await supabase
     .from('crm_messages')
     .select('thread_id')
-    .eq('message_id', inReplyTo)
+    .in('message_id', idVariants(inReplyTo))
     .limit(1)
     .maybeSingle()
   if (error) throw error
@@ -142,18 +145,24 @@ async function createThread({ leadId, emailAccountId, subject, counterparty }) {
 async function bumpThread(threadId, { direction, sentAt, incUnread, markResponded, snippet }) {
   const { data: t, error: readErr } = await supabase
     .from('crm_threads')
-    .select('message_count, unread_count, status')
+    .select('message_count, unread_count, status, last_message_at')
     .eq('id', threadId)
     .single()
   if (readErr) throw readErr
 
+  const when = sentAt || new Date().toISOString()
+  // A late-imported OLDER message (inbox reconciler / backfill) still counts, but must not
+  // roll the thread's "latest message" time, direction or preview backwards.
+  const isLatest = !t.last_message_at || new Date(when) >= new Date(t.last_message_at)
   const patch = {
-    last_message_at: sentAt || new Date().toISOString(),
-    last_direction: direction,
     message_count: (t.message_count || 0) + 1,
     unread_count: (t.unread_count || 0) + (incUnread ? 1 : 0)
   }
-  if (typeof snippet === 'string') patch.last_snippet = snippet
+  if (isLatest) {
+    patch.last_message_at = when
+    patch.last_direction = direction
+    if (typeof snippet === 'string') patch.last_snippet = snippet
+  }
   // "responded" means a real client wrote back — a matched lead, not an
   // auto-reply/bounce/newsletter. Everything else stays 'open' so the Inbox
   // filters and the Responses view actually mean something.
@@ -172,7 +181,7 @@ async function bumpThread(threadId, { direction, sentAt, incUnread, markResponde
 
 // ── per-lead status ───────────────────────────────────────
 
-async function upsertLeadStatus(leadId, patch) {
+async function upsertLeadStatus(leadId, patch, { historical = false } = {}) {
   if (!leadId) return
   const now = new Date().toISOString()
   const { data: existing, error: readErr } = await supabase
@@ -190,6 +199,13 @@ async function upsertLeadStatus(leadId, patch) {
     return
   }
   const merged = { updated_at: now, last_activity_at: now, ...patch }
+  // The last real reply from the lead only ever moves FORWARD, and importing an old message
+  // later must not make the lead look active "now" (it feeds the Gone Quiet cutoff).
+  if (
+    merged.last_inbound_activity_at && existing.last_inbound_activity_at &&
+    new Date(existing.last_inbound_activity_at) > new Date(merged.last_inbound_activity_at)
+  ) delete merged.last_inbound_activity_at
+  if (historical) delete merged.last_activity_at
   // never downgrade a stage once it's past 'contacted'
   const rank = { new: 0, contacted: 1, responded: 2, negotiating: 3, won: 4, lost: 4 }
   if (merged.stage && (rank[merged.stage] ?? 0) < (rank[existing.stage] ?? 0)) {
@@ -204,14 +220,14 @@ export async function markLeadContacted(leadId, at) {
   await upsertLeadStatus(leadId, { stage: 'contacted', last_activity_at: at || new Date().toISOString() })
 }
 
-export async function markLeadResponded(leadId, at) {
+export async function markLeadResponded(leadId, at, { historical = false } = {}) {
   const when = at || new Date().toISOString()
   // last_inbound_activity_at is deliberately separate from last_activity_at (which
   // upsertLeadStatus always bumps to "now" on every call, including our own outbound
   // sends via markLeadContacted). Only genuine inbound replies touch this field, so
   // the "Needs a Decision — Gone Quiet" cutoff (crm-automation.js) measures how long
   // the LEAD has been silent, not how recently we last emailed them.
-  await upsertLeadStatus(leadId, { stage: 'responded', first_response_at: when, last_inbound_activity_at: when })
+  await upsertLeadStatus(leadId, { stage: 'responded', first_response_at: when, last_inbound_activity_at: when }, { historical })
 }
 
 /**
@@ -233,12 +249,16 @@ export async function stopLeadFollowUps(leadId, at) {
 
 // ── messages ──────────────────────────────────────────────
 
+// Rows saved by the n8n workflow before 2026-10 carry the raw header line ("Message-ID: <x>")
+// instead of "<x>" — match those too, so the same email is never stored twice.
+const idVariants = (id) => [id, `Message-ID: ${id}`, `Message-Id: ${id}`]
+
 async function messageExists(messageId) {
   if (!messageId) return false
   const { data, error } = await supabase
     .from('crm_messages')
     .select('id')
-    .eq('message_id', messageId)
+    .in('message_id', idVariants(messageId))
     .limit(1)
     .maybeSingle()
   if (error) throw error
@@ -288,8 +308,15 @@ export async function recordAttachment({ messageId, leadId, kind, filename, cont
  * @param {Array}  p.attachments    [{ filename, contentType, size }]
  */
 export async function ingestInboundEmail(p) {
-  if (p.messageId && (await messageExists(p.messageId))) {
-    return { status: 'duplicate', messageId: p.messageId }
+  // Canonical ids (the n8n feed sends the raw header line) and bodies that fit the database
+  // limit (it also pastes multi-MB inline pictures into the HTML) — see crm-mail-utils.js.
+  const messageId = normalizeMessageId(p.messageId)
+  const inReplyTo = normalizeMessageId(p.inReplyTo)
+  const bodyText = clipText(p.bodyText)
+  const bodyHtml = slimHtml(p.bodyHtml)
+
+  if (messageId && (await messageExists(messageId))) {
+    return { status: 'duplicate', messageId }
   }
 
   const account =
@@ -300,7 +327,7 @@ export async function ingestInboundEmail(p) {
   const counterparty = (p.fromAddr || '').trim().toLowerCase()
 
   let threadId =
-    (await findThreadByInReplyTo(p.inReplyTo)) ||
+    (await findThreadByInReplyTo(inReplyTo)) ||
     (await findThreadBySubject(subjectNorm, counterparty))
 
   if (!threadId) {
@@ -317,16 +344,16 @@ export async function ingestInboundEmail(p) {
     thread_id: threadId,
     lead_id: lead ? lead.id : null,
     direction: 'inbound',
-    message_id: p.messageId || null,
-    in_reply_to: p.inReplyTo || null,
+    message_id: messageId || null,
+    in_reply_to: inReplyTo || null,
     from_addr: p.fromAddr || null,
     from_name: p.fromName || null,
     to_addrs: p.toAddrs || null,
     cc_addrs: p.ccAddrs || null,
     subject: p.subject || null,
-    body_text: p.bodyText || null,
-    body_html: p.bodyHtml || null,
-    snippet: makeSnippet(p.bodyText || p.bodyHtml),
+    body_text: bodyText || null,
+    body_html: bodyHtml || null,
+    snippet: makeSnippet(bodyText || bodyHtml),
     is_read: !!p.backfill,
     is_auto_reply: isAuto,
     sent_at: p.sentAt || new Date().toISOString()
@@ -352,7 +379,7 @@ export async function ingestInboundEmail(p) {
   })
 
   if (lead && !isAuto) {
-    await markLeadResponded(lead.id, message.sent_at).catch((e) =>
+    await markLeadResponded(lead.id, message.sent_at, { historical: !!p.backfill }).catch((e) =>
       console.warn('[crm] markLeadResponded failed:', e.message)
     )
     await stopLeadFollowUps(lead.id, message.sent_at).catch((e) =>
@@ -535,8 +562,24 @@ export async function markAllThreadsRead() {
 // schema; explicit deletes are safe either way (a cascade just makes the later
 // deletes no-ops). Does NOT touch attachment files already on disk/Drive — only
 // removes the database rows a deleted thread would otherwise leave behind.
+// Message-IDs of conversations deleted in the CRM, so crm-inbox-reconcile.js (which re-imports
+// anything in the mailbox the CRM lacks) never resurrects a thread someone removed on purpose.
+const DELETED_FILE = path.join(process.cwd(), 'crm-deleted-message-ids.json')
+export function loadDeletedMessageKeys() {
+  try { return new Set(JSON.parse(fs.readFileSync(DELETED_FILE, 'utf8'))) } catch { return new Set() }
+}
+function rememberDeletedMessageIds(ids) {
+  try {
+    const keys = loadDeletedMessageKeys()
+    for (const id of ids) { const k = idKey(id); if (k) keys.add(k) }
+    fs.writeFileSync(DELETED_FILE, JSON.stringify([...keys]))
+  } catch (e) {
+    console.warn('[crm] could not remember deleted message ids:', e.message)
+  }
+}
+
 export async function deleteThread(threadId) {
-  const { data: msgs, error: mErr } = await supabase.from('crm_messages').select('id').eq('thread_id', threadId)
+  const { data: msgs, error: mErr } = await supabase.from('crm_messages').select('id, message_id').eq('thread_id', threadId)
   if (mErr) throw mErr
   const messageIds = (msgs || []).map((m) => m.id)
   if (messageIds.length) {
@@ -547,6 +590,7 @@ export async function deleteThread(threadId) {
   if (msgDelErr) throw msgDelErr
   const { error: tErr } = await supabase.from('crm_threads').delete().eq('id', threadId)
   if (tErr) throw tErr
+  rememberDeletedMessageIds((msgs || []).map((m) => m.message_id))
 }
 
 export async function setThreadStatus(threadId, status) {

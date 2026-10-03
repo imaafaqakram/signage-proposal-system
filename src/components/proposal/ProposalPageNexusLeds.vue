@@ -122,6 +122,7 @@
                         <input v-model="item.label" class="nl-table-input nl-input-badge no-print" :placeholder="getSizePlaceholder(idx)" />
                         <span class="nl-print-only">{{ item.label || getSizePlaceholder(idx) }}</span>
                       </div>
+                      <span v-if="Number(item.quantity) > 1" class="nl-qty-badge">QTY {{ item.quantity }}</span>
                     </td>
                     <td><input v-model="item.dim" class="nl-table-input" placeholder="e.g. 48 in x 22 in" /></td>
                     <td>
@@ -130,11 +131,8 @@
                       </div>
                     </td>
                     <td class="nl-td-discount">
-                      {{ item.discounted || calculateDiscount(item.cost) }} USD
-                      <br/>
-                      <a v-if="page.id" :href="`https://signagecrafting.vercel.app/api/stripe/pay/${$route.params.clientId}?itemId=${page.id}&priceIdx=${idx}`" target="_blank" class="text-[9px] bg-blue-600 text-white px-2 py-1 rounded font-bold uppercase hover:bg-blue-700 transition-colors inline-block no-underline shadow-sm" style="margin-top: 8px; position: relative; z-index: 50;">
-                        <i class="fas fa-lock" style="margin-right: 4px;"></i> Pay Now
-                      </a>
+                      <a v-if="page.paymentLink" :href="page.paymentLink" target="_blank" class="nl-price-link">{{ item.discounted || calculateDiscount(item.cost, item.quantity) }} USD</a>
+                      <span v-else>{{ item.discounted || calculateDiscount(item.cost, item.quantity) }} USD</span>
                     </td>
                     <td class="no-print">
                          <button @click="removePriceRow(idx)" class="nl-btn-del-row" title="Remove Row">×</button>
@@ -158,19 +156,24 @@
                 </thead>
                 <tbody>
                   <tr v-for="(item, idx) in page.pricing" :key="idx">
-                    <td class="nl-print-badge-cell">{{ item.label || getSizePlaceholder(idx) }}</td>
+                    <td class="nl-print-badge-cell">
+                      {{ item.label || getSizePlaceholder(idx) }}
+                      <span v-if="Number(item.quantity) > 1" class="nl-qty-badge" style="color:#000">QTY {{ item.quantity }}</span>
+                    </td>
                     <td>{{ item.dim }}</td>
                     <td>{{ item.cost }}</td>
                     <td style="font-weight: 700; color: #000;">
-                      {{ item.discounted || calculateDiscount(item.cost) }} USD
-                      <br/>
-                      <a v-if="page.id" :href="`https://signagecrafting.vercel.app/api/stripe/pay/${$route.params.clientId}?itemId=${page.id}&priceIdx=${idx}`" target="_blank" class="text-[9px] bg-blue-600 text-white px-2 py-1 rounded font-bold uppercase hover:bg-blue-700 transition-colors inline-block no-underline shadow-sm" style="margin-top: 4px; position: relative; z-index: 50;">
-                        <i class="fas fa-lock" style="margin-right: 4px;"></i> Pay Now
-                      </a>
+                      <a v-if="page.paymentLink" :href="page.paymentLink" target="_blank" style="color:inherit">{{ item.discounted || calculateDiscount(item.cost, item.quantity) }} USD</a>
+                      <span v-else>{{ item.discounted || calculateDiscount(item.cost, item.quantity) }} USD</span>
                     </td>
                   </tr>
                 </tbody>
               </table>
+              <!-- Deliberately no standalone Pay Now block here — see
+                   ProposalPageSignCrafters.vue's comment on its discount box for why: a
+                   separate block added net-new height that overlapped the card below it
+                   in a fixed-height page layout. The clickable price above is the pay
+                   entry point for this template. -->
             </div>
 
             <!-- Package Included -->
@@ -407,11 +410,12 @@ const handleFileChange = (e, pi, ai) => {
   const file = e.target.files?.[0]
   if (file) emit('upload-image', { pageIndex: pi, assetIndex: ai, url: URL.createObjectURL(file), mediaType: file.type.startsWith('video/') ? 'video' : 'image' })
 }
-const calculateDiscount = (price) => {
+const calculateDiscount = (price, quantity = 1) => {
   if (!price) return null
   const n = parseFloat(price.toString().replace(/[^0-9.]/g, ''))
   if (isNaN(n)) return null
-  const d = n * 0.90
+  const qty = Number(quantity) || 1
+  const d = n * qty * 0.90
   return '$ ' + d.toLocaleString('en-US', { minimumFractionDigits: 0, maximumFractionDigits: 0 })
 }
 
@@ -445,7 +449,7 @@ const getVector = (idx, evt) => {
 }
 
 const addPriceRow = () => {
-  props.page.pricing.push({ label: 'Size', dim: '00in x 00in', cost: 0, size: 'Medium' })
+  props.page.pricing.push({ label: 'Size', dim: '00in x 00in', cost: 0, size: 'Medium', quantity: 1 })
 }
 const removePriceRow = (idx) => {
   props.page.pricing.splice(idx, 1)
@@ -685,6 +689,19 @@ const hexToRgba = (hex, alpha) => {
 }
 .nl-input-badge { font-size: 13px; font-weight: 800; color: #ffffff; text-align: center; letter-spacing: 0.3px; }
 .nl-print-only { display: none; }
+
+/* Quantity badge — small text under the size badge, only shown when qty > 1. Not a
+   table column: a prior attempt to add Qty as its own column squeezed the Price/
+   Discounted Price cells too narrow and broke their layout. */
+.nl-qty-badge {
+  display: block;
+  margin-top: 3px;
+  font-size: 9px;
+  font-weight: 700;
+  color: var(--text-accent, #00f3ff);
+  letter-spacing: 0.03em;
+}
+.nl-price-link { color: inherit; text-decoration: none; cursor: pointer; border-bottom: 1px dashed currentColor; }
 
 .nl-package { margin-top: auto; border: 1px solid var(--border-color); border-radius: 8px; padding: 10px; background: rgba(255,255,255,0.02); }
 .nl-pkg-title { font-size: 10px; font-weight: 800; text-transform: uppercase; color: var(--text-color); margin-bottom: 8px; border-bottom: 1px solid var(--border-color); }

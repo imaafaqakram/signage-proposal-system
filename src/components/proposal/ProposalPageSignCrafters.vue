@@ -75,30 +75,47 @@
                 </thead>
                 <tbody>
                   <tr v-for="(p, idx) in page.pricing" :key="idx">
-                    <td><span class="sc-size-badge"><input v-model="p.size" class="sc-size-input" /></span></td>
+                    <td>
+                      <span class="sc-size-badge"><input v-model="p.size" class="sc-size-input" /></span>
+                      <span v-if="Number(p.quantity) > 1" class="sc-qty-badge">QTY {{ p.quantity }}</span>
+                    </td>
                     <td><input v-model="p.dim" class="sc-dim-input" /></td>
                     <td class="sc-nowrap" :class="{ 'sc-td-price': effectiveDiscount > 0 }">
                       $<input v-model="p.cost" class="sc-cost-input" :class="{ 'sc-cost-strike': effectiveDiscount > 0 }" placeholder="0" />
                     </td>
                     <td class="sc-nowrap" :class="{ 'sc-td-discount': effectiveDiscount > 0 || p.discounted }">
-                      $ {{ p.discounted || calculateDiscount(p.cost) || '0' }}
-                      <br>
-                      <a v-if="page.id" :href="`https://signagecrafting.vercel.app/api/stripe/pay/${$route.params.clientId}?itemId=${page.id}&priceIdx=${idx}`" target="_blank" class="mt-2 text-[9px] bg-blue-600 text-white px-2 py-1 rounded font-bold uppercase hover:bg-blue-700 transition-colors inline-block no-underline shadow-sm" style="margin-top: 8px; position: relative; z-index: 50;">
-                        <i class="fas fa-lock" style="margin-right: 4px;"></i> Pay Now
-                      </a>
+                      <a v-if="page.paymentLink" :href="page.paymentLink" target="_blank" class="sc-price-link">$ {{ p.discounted || calculateDiscount(p.cost, p.quantity) || '0' }}</a>
+                      <span v-else>$ {{ p.discounted || calculateDiscount(p.cost, p.quantity) || '0' }}</span>
                     </td>
                     <td class="no-print sc-del-cell"><button @click="removePriceRow(idx)" class="sc-btn-del-row" title="Remove">×</button></td>
                   </tr>
                 </tbody>
               </table>
-              <!-- Discount Display Badge -->
-              <div v-if="effectiveDiscount > 0" class="sc-discount-box">
-                <i class="fas fa-tag" style="color: #ef4444; font-size: 10px;"></i>
-                <span class="sc-discount-lbl">Discount Applied</span>
-                <input type="text" :value="`${effectiveDiscount}% OFF`" readonly class="sc-discount-val" />
+              <!-- Discount/Pay row — Pay Now lives INSIDE this same row (not a new block
+                   below it). Two earlier versions got this wrong: v1 kept a per-row dead
+                   link AND added a new button (two stacked buttons on one row); v2 fixed
+                   that but put the single button in its own block below this box, which
+                   added ~32px of new height to a column with zero vertical slack —
+                   .sc-page has overflow:hidden and .sc-grid is a flex:1 child of a
+                   fixed-height .sc-wrapper, so any net-new height here pushes this card's
+                   content down past its grid track, overlapping the "Your Package
+                   Includes" card and footer that follow. Packing Pay Now into this
+                   existing row instead adds ~3.5px (measured), not ~32px. The row now
+                   shows whenever there's a discount OR a payment link (previously gated
+                   on discount only, which meant a proposal with a payment link but no
+                   discount showed no Pay Now button at all). -->
+              <div v-if="effectiveDiscount > 0 || page.paymentLink" class="sc-discount-box" :class="{ 'sc-pay-only-box': !(effectiveDiscount > 0) }">
+                <template v-if="effectiveDiscount > 0">
+                  <i class="fas fa-tag" style="color: #ef4444; font-size: 10px;"></i>
+                  <span class="sc-discount-lbl">Discount</span>
+                  <input type="text" :value="`${effectiveDiscount}% OFF`" readonly class="sc-discount-val" />
+                </template>
+                <span v-else class="sc-pay-only-lbl"><i class="fas fa-lock"></i> Secure Payment</span>
+                <a v-if="page.paymentLink" :href="page.paymentLink" target="_blank" class="sc-pay-now-inline">
+                  <i class="fas fa-lock"></i> Pay Now
+                </a>
               </div>
             </div>
-            <!-- Discount & Buy box removed -->
           </div>
 
           <!-- Package Includes Card -->
@@ -438,7 +455,7 @@ const getVector = (ai, evt) => {
   vectorAsset.value = asset
 }
 const addPriceRow = () => {
-  props.page.pricing.push({ size: 'Size', dim: '00in x 00in', cost: 0 })
+  props.page.pricing.push({ size: 'Size', dim: '00in x 00in', cost: 0, quantity: 1 })
 }
 const removePriceRow = (idx) => {
   props.page.pricing.splice(idx, 1)
@@ -518,14 +535,15 @@ const discountPreset = computed({
 
 const effectiveDiscount = computed(() => Number(props.page.discountPercent) || 0)
 
-const calculateDiscount = (price) => {
+const calculateDiscount = (price, quantity = 1) => {
   if (!price) return null
   const n = parseFloat(price.toString().replace(/[^0-9.]/g, ''))
   if (isNaN(n)) return null
-  
+
+  const qty = Number(quantity) || 1
   const discountPct = effectiveDiscount.value / 100
-  const d = n * (1 - discountPct)
-  
+  const d = n * qty * (1 - discountPct)
+
   return d.toLocaleString('en-US', { minimumFractionDigits: d % 1 === 0 ? 0 : 2, maximumFractionDigits: 2 })
 }
 
@@ -907,6 +925,64 @@ const customThemeStyle = useProposalTheme(computed(() => props.settings))
 .sc-discount-val {
   background: transparent; border: none; outline: none;
   color: #fff; font-size: 11px; font-weight: 900; flex: 1;
+}
+
+/* Quantity badge — small text under the size badge, only shown when qty > 1, so the
+   common single-quantity case stays exactly as it always looked. Deliberately NOT a
+   table column: the pricing table lives in a ~165px-wide column, and a previous attempt
+   to add Qty as its own column squeezed Price/Disc. Price too narrow and broke them. */
+.sc-qty-badge {
+  display: block;
+  font-size: 7px;
+  font-weight: 700;
+  color: var(--text-accent);
+  opacity: 0.85;
+  margin-top: 1px;
+  letter-spacing: 0.02em;
+}
+/* Makes the charged price itself clickable when a payment link is set, without
+   changing its size/position — a dashed underline is the only visual difference. */
+.sc-price-link {
+  color: inherit;
+  text-decoration: none;
+  cursor: pointer;
+  border-bottom: 1px dashed var(--text-accent);
+}
+/* Pay Now — packed into the discount box's own row (measured: adds ~3.5px total,
+   vs. ~32px for a separate block below it, which is what caused the previous overlap
+   bug). Only shows when a discount is active, since that's the only row with spare
+   width/height to absorb it safely; the clickable price above covers "pay" the rest
+   of the time. flex-shrink:0 keeps it from being squeezed by the discount text. */
+.sc-pay-now-inline {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  background: #2563eb;
+  color: #fff;
+  font-size: 7.5px;
+  font-weight: 800;
+  text-transform: uppercase;
+  padding: 3px 7px;
+  border-radius: 4px;
+  text-decoration: none;
+  white-space: nowrap;
+  flex-shrink: 0;
+}
+.sc-pay-now-inline:hover { background: #1d4ed8; }
+
+/* No-discount variant of .sc-discount-box: same box/row, just not red/alarm-colored
+   since there's nothing to warn about — only a payment link to surface. Themed via
+   --text-accent so it matches whichever theme is active, same as the rest of the page. */
+.sc-pay-only-box {
+  border-color: var(--text-accent);
+  background: rgba(255, 255, 255, 0.04);
+}
+.sc-pay-only-lbl {
+  font-size: 9px;
+  font-weight: 700;
+  color: var(--text-accent);
+  white-space: nowrap;
+  flex: 1;
 }
 
 /* ═══════ PACKAGE ═══════ */

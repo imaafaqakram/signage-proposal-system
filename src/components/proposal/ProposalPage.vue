@@ -36,13 +36,14 @@
                 </tr>
               </thead>
               <tbody>
-                <tr 
-                  v-for="(p, idx) in page.pricing" 
+                <tr
+                  v-for="(p, idx) in page.pricing"
                   :key="idx"
                   class="theme-border-b hover:bg-white/5 transition-colors"
                 >
                   <td class="py-3 px-2 font-bold w-[15%]">
                     <input v-model="p.size" class="editable-input" />
+                    <span v-if="Number(p.quantity) > 1" class="block text-[8px] font-bold theme-text-accent opacity-80 mt-0.5">QTY {{ p.quantity }}</span>
                   </td>
                   <td class="py-3 px-2 w-[60%] text-center">
                     <input v-model="p.dim" class="editable-input theme-text-muted text-xs text-center" />
@@ -53,16 +54,26 @@
                         <span v-else-if="p.cost" class="bg-teal-900/50 text-teal-400 px-1 py-0 rounded text-[7px] font-bold whitespace-nowrap mb-0.5">15% OFF</span>
                         <div class="flex items-center">
                           <span class="theme-text-accent font-bold mr-0.5">$</span>
-                          <span class="text-right font-bold theme-text-accent text-lg leading-none">{{ p.discounted || calculateDiscount(p.cost) || '0' }}</span>
+                          <a v-if="page.paymentLink" :href="page.paymentLink" target="_blank" class="text-right font-bold theme-text-accent text-lg leading-none no-underline border-b border-dashed border-current">{{ p.discounted || calculateDiscount(p.cost, p.quantity) || '0' }}</a>
+                          <span v-else class="text-right font-bold theme-text-accent text-lg leading-none">{{ p.discounted || calculateDiscount(p.cost, p.quantity) || '0' }}</span>
                         </div>
-                        <a v-if="page.id" :href="`https://signagecrafting.vercel.app/api/stripe/pay/${$route.params.clientId}?itemId=${page.id}&priceIdx=${idx}`" target="_blank" class="mt-2 text-[9px] bg-blue-600 text-white px-2 py-1 rounded font-bold uppercase hover:bg-blue-700 transition-colors inline-block no-underline shadow-sm" style="position: relative; z-index: 50;">
-                          <i class="fas fa-lock mr-1"></i> Pay Now
-                        </a>
                       </div>
                   </td>
                 </tr>
               </tbody>
             </table>
+            <!-- This page's root uses the plain global .a4-page (min-height: 297mm, no
+                 max-height/overflow:hidden — see src/style.css) so it grows taller with
+                 extra content instead of clipping/overlapping, unlike
+                 ProposalPageSignCrafters.vue's/ProposalPageNexusLeds.vue's fixed-height
+                 landscape pages (.sc-page/.nl-page, max-height:210mm + overflow:hidden).
+                 A standalone block here carries none of the overlap risk that caused the
+                 bug in those two, so it's safe to add one. -->
+            <div v-if="page.paymentLink" class="mt-2 text-center">
+              <a :href="page.paymentLink" target="_blank" class="inline-flex items-center gap-1 bg-blue-600 hover:bg-blue-700 text-white text-[9px] font-bold uppercase tracking-wide px-3 py-1.5 rounded-full transition-colors no-underline">
+                <i class="fas fa-lock"></i> Pay Now
+              </a>
+            </div>
           </div>
 
           <!-- Specifications -->
@@ -360,11 +371,12 @@ const handleDrop = (event, pageIndex, assetIndex) => {
   }
 }
 
-const calculateDiscount = (price) => {
+const calculateDiscount = (price, quantity = 1) => {
   if (!price) return null
   const n = parseFloat(price.toString().replace(/[^0-9.]/g, ''))
   if (isNaN(n)) return null
-  const d = n * 0.90
+  const qty = Number(quantity) || 1
+  const d = n * qty * 0.90
   return d.toLocaleString('en-US', { minimumFractionDigits: d % 1 === 0 ? 0 : 2, maximumFractionDigits: 2 })
 }
 

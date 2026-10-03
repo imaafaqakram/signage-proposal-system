@@ -6,13 +6,13 @@
         <h1 class="text-4xl font-extrabold text-white mb-2">
           Signage <span class="text-teal-400">Crafting</span>
         </h1>
-        <p class="text-gray-400 text-sm">Proposal Management System</p>
+        <p class="text-gray-400 text-sm">{{ onCrmHost ? 'Customer Relationship Management' : 'Proposal Management System' }}</p>
       </div>
 
       <!-- Login Card -->
       <div class="bg-gray-800 rounded-lg shadow-xl p-8 border border-gray-700">
         <!-- Tab Switcher -->
-        <div v-if="!bypassMode" class="flex mb-6 bg-gray-900 rounded-lg p-1">
+        <div v-if="!bypassMode && !showPersonal && !configLoading" class="flex mb-6 bg-gray-900 rounded-lg p-1">
           <button
             @click="activeTab = 'signin'"
             :class="[
@@ -38,7 +38,7 @@
         </div>
 
         <!-- Bypass Mode Notice -->
-        <div v-if="bypassMode" class="mb-6 bg-yellow-900/30 border border-yellow-700 rounded-lg p-4">
+        <div v-if="bypassMode && !showPersonal && !configLoading" class="mb-6 bg-yellow-900/30 border border-yellow-700 rounded-lg p-4">
           <div class="flex items-start">
             <i class="fas fa-exclamation-triangle text-yellow-500 mt-0.5 mr-3"></i>
             <div>
@@ -60,8 +60,57 @@
           <p class="text-green-200 text-sm">{{ successMessage }}</p>
         </div>
 
+        <!-- CRM host: waiting to learn whether personal accounts exist (avoids flashing the wrong form) -->
+        <div v-if="configLoading" class="text-center text-gray-400 py-10">
+          <i class="fas fa-spinner fa-spin"></i>
+        </div>
+
+        <!-- Personal CRM account (CRM host, once at least one account exists) -->
+        <form v-else-if="showPersonal" @submit.prevent="handlePersonalLogin" class="space-y-4">
+          <div>
+            <label class="block text-gray-300 text-sm font-medium mb-2">Username</label>
+            <input
+              v-model="personalUsername"
+              type="text"
+              autocomplete="username"
+              autocapitalize="off"
+              spellcheck="false"
+              placeholder="e.g. jordan.smith"
+              class="w-full bg-gray-700 text-white px-4 py-3 rounded-lg border border-gray-600 focus:border-teal-500 focus:outline-none"
+              required
+            />
+          </div>
+          <div>
+            <label class="block text-gray-300 text-sm font-medium mb-2">Password</label>
+            <div class="flex items-center gap-2">
+              <input
+                v-model="personalPassword"
+                :type="showPersonalPassword ? 'text' : 'password'"
+                autocomplete="current-password"
+                placeholder="Your password"
+                class="flex-1 bg-gray-700 text-white px-4 py-3 rounded-lg border border-gray-600 focus:border-teal-500 focus:outline-none"
+                required
+              />
+              <button type="button" @click="showPersonalPassword = !showPersonalPassword" class="text-gray-400 hover:text-gray-200 px-2" aria-label="Show or hide password">
+                <i class="fas" :class="showPersonalPassword ? 'fa-eye-slash' : 'fa-eye'"></i>
+              </button>
+            </div>
+          </div>
+          <button
+            type="submit"
+            :disabled="loading"
+            class="w-full bg-teal-600 hover:bg-teal-500 disabled:bg-gray-600 text-white font-semibold py-3 rounded-lg transition-colors flex items-center justify-center"
+          >
+            <i v-if="loading" class="fas fa-spinner fa-spin mr-2"></i>
+            {{ loading ? 'Signing in...' : 'Sign in' }}
+          </button>
+          <p v-if="crmConfig && crmConfig.sharedLoginAllowed" class="text-center text-xs text-gray-500 pt-1">
+            <button type="button" class="underline hover:text-gray-300" @click="useShared = true">Use the shared password instead</button>
+          </p>
+        </form>
+
         <!-- Bypass Mode Form -->
-        <form v-if="bypassMode" @submit.prevent="handleBypassLogin" class="space-y-4">
+        <form v-else-if="bypassMode" @submit.prevent="handleBypassLogin" class="space-y-4">
           <div>
             <label class="block text-gray-300 text-sm font-medium mb-2">
               Bypass Password
@@ -101,6 +150,9 @@
             <i v-if="loading" class="fas fa-spinner fa-spin mr-2"></i>
             {{ loading ? 'Verifying...' : 'Continue' }}
           </button>
+          <p v-if="onCrmHost && crmConfig && crmConfig.personalLoginEnabled" class="text-center text-xs text-gray-500 pt-1">
+            <button type="button" class="underline hover:text-gray-300" @click="useShared = false">Back to personal sign-in</button>
+          </p>
         </form>
 
         <!-- Regular Auth Forms -->
@@ -155,7 +207,7 @@
 </template>
 
 <script setup>
-import { ref, computed } from 'vue'
+import { ref, computed, onMounted } from 'vue'
 import { useRouter } from 'vue-router'
 import { useAuthStore } from '@/stores/authStore'
 import { isSupabaseConfigured } from '@/services/supabase'
@@ -176,6 +228,43 @@ const successMessage = ref('')
 const loading = ref(false)
 
 const bypassMode = computed(() => authStore.bypassMode)
+
+// ── personal CRM accounts (CRM host only; the Proposal System login is untouched) ──
+const onCrmHost = typeof location !== 'undefined' && /^crm\./i.test(location.hostname)
+const crmConfig = ref(null)
+const configLoading = ref(onCrmHost)
+const useShared = ref(false)
+const personalUsername = ref('')
+const personalPassword = ref('')
+const showPersonalPassword = ref(false)
+const showPersonal = computed(() => onCrmHost && !!crmConfig.value?.personalLoginEnabled && !useShared.value)
+
+onMounted(async () => {
+  if (!onCrmHost) return
+  try {
+    const res = await fetch('/api/crm/auth/config', { signal: AbortSignal.timeout(6000) })
+    if (res.ok) crmConfig.value = await res.json()
+  } catch {
+    // Can't tell — fall back to the regular login form so nobody is ever locked out here.
+  } finally {
+    configLoading.value = false
+  }
+})
+
+const handlePersonalLogin = async () => {
+  errorMessage.value = ''
+  successMessage.value = ''
+  loading.value = true
+  try {
+    const me = await authStore.personalLogin(personalUsername.value, personalPassword.value)
+    successMessage.value = `Welcome, ${me.name}!`
+    setTimeout(() => { router.push({ name: 'home' }) }, 400)
+  } catch (error) {
+    errorMessage.value = error.message
+  } finally {
+    loading.value = false
+  }
+}
 
 const handleBypassLogin = async () => {
   errorMessage.value = ''

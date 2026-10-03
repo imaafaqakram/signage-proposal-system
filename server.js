@@ -35,6 +35,10 @@ import { createCrmOrdersRouter } from './crm-orders.js'
 import { createCrmExpensesRouter } from './crm-expenses.js'
 import { createCrmMaterialsRouter } from './crm-materials.js'
 import { createCrmVendorsRouter } from './crm-vendors.js'
+import { createCrmAuth } from './crm-auth.js'
+import { createCrmFxRouter } from './crm-fx.js'
+import { createCrmHistoryRouter } from './crm-audit.js'
+import { createCrmBroadcastRouter, startBroadcastWorker } from './crm-broadcast.js'
 import { pollSentFolder as crmPollSentFolder } from './crm-sent-poll.js'
 import { logOutboundEmail as crmLogOutbound, recordAttachment as crmRecordAttachment } from './crm-db.js'
 import { saveLeadVersion, listLeads, listVersions, getVersion, deleteLead, listBatches, getBatchLeads, getLeadsByDate, getLeadByCrmRecordId, markLeadEmailSent, markLeadCrmDate, stopFollowUps, resumeFollowUps, getFollowUpCandidates, recordFollowUpSent } from './db.js'
@@ -434,17 +438,38 @@ app.use('/api/batch', batchRouter)
 app.use('/api/image-gen', imageGenRouter)
 app.use('/api/pdf-gen', pdfGenRouter)
 app.use('/api/stripe', stripeRouter)
-app.use('/api/crm', createCrmRouter({ requireAuth: requireBypassAuth }))
-app.use('/api/crm/leads', createCrmLeadsRouter({ requireAuth: requireBypassAuth }))
-app.use('/api/crm/stats', createCrmStatsRouter({ requireAuth: requireBypassAuth }))
-app.use('/api/crm/templates', createCrmTemplatesRouter({ requireAuth: requireBypassAuth }))
-app.use('/api/crm/board', createCrmBoardRouter({ requireAuth: requireBypassAuth }))
-app.use('/api/crm/projects', createCrmProjectsRouter({ requireAuth: requireBypassAuth }))
-app.use('/api/crm/automation', createCrmAutomationRouter({ requireAuth: requireBypassAuth, requireAdmin }))
-app.use('/api/crm/orders', createCrmOrdersRouter({ requireAuth: requireAdmin }))
-app.use('/api/crm/expenses', createCrmExpensesRouter({ requireAuth: requireAdmin }))
-app.use('/api/crm/materials', createCrmMaterialsRouter({ requireAuth: requireAdmin }))
-app.use('/api/crm/vendors', createCrmVendorsRouter({ requireAuth: requireAdmin }))
+// ── CRM auth ─────────────────────────────────────────────────────────────────────────
+// Personal per-user logins (crm-auth.js) layered on top of the two shared-password
+// sessions above. Only the /api/crm/* mounts use these guards — the Proposal System's
+// own routes keep requireBypassAuth / requireAdmin exactly as they were. The new
+// guards accept the old shared tokens too (until an admin turns on "require personal
+// logins" on the Team page) and additionally tell every route WHO the caller is.
+const crmAuth = createCrmAuth({
+  bypassSessions: activeBypassSessions,
+  adminSessions: activeAdminSessions,
+  loadAdminSettings,
+  saveAdminSettings
+})
+const { requireCrmAuth, requireCrmAdmin } = crmAuth
+// Mounted BEFORE the catch-all-ish '/api/crm' router so /api/crm/auth/login etc. are never
+// swallowed by its own auth-guarded routes.
+app.use('/api/crm/auth', crmAuth.authRouter)
+app.use('/api/crm/users', crmAuth.usersRouter)
+app.use('/api/crm/fx', createCrmFxRouter({ requireAuth: requireCrmAuth }))
+app.use('/api/crm/history', createCrmHistoryRouter({ requireAuth: requireCrmAuth, requireAdmin: requireCrmAdmin, isAdmin: crmAuth.isAdminRequest }))
+// Client announcements (admin-only; queue + 30-per-hour sender live in crm-broadcast.js).
+app.use('/api/crm/broadcasts', createCrmBroadcastRouter({ requireAuth: requireCrmAdmin, loadAdminSettings }))
+app.use('/api/crm', createCrmRouter({ requireAuth: requireCrmAuth }))
+app.use('/api/crm/leads', createCrmLeadsRouter({ requireAuth: requireCrmAuth }))
+app.use('/api/crm/stats', createCrmStatsRouter({ requireAuth: requireCrmAuth }))
+app.use('/api/crm/templates', createCrmTemplatesRouter({ requireAuth: requireCrmAuth }))
+app.use('/api/crm/board', createCrmBoardRouter({ requireAuth: requireCrmAuth }))
+app.use('/api/crm/projects', createCrmProjectsRouter({ requireAuth: requireCrmAuth }))
+app.use('/api/crm/automation', createCrmAutomationRouter({ requireAuth: requireCrmAuth, requireAdmin: requireCrmAdmin }))
+app.use('/api/crm/orders', createCrmOrdersRouter({ requireAuth: requireCrmAdmin }))
+app.use('/api/crm/expenses', createCrmExpensesRouter({ requireAuth: requireCrmAdmin }))
+app.use('/api/crm/materials', createCrmMaterialsRouter({ requireAuth: requireCrmAdmin }))
+app.use('/api/crm/vendors', createCrmVendorsRouter({ requireAuth: requireCrmAdmin }))
 
 console.log('🚀 Starting Luminus Multi-AI Server...')
 
@@ -2397,4 +2422,8 @@ setTimeout(() => {
     crmPollSentFolder({ days: 3 }).catch((e) => console.warn('⚠️  CRM sent-poll failed:', e.message))
   }, CRM_SENT_POLL_MS)
 }, 30 * 1000)
+
+// CRM client announcements: background sender (30 emails per rolling hour). Off unless
+// CRM_BROADCAST_WORKER=true is set in THIS server's .env — see crm-broadcast.js.
+startBroadcastWorker({ loadAdminSettings })
 

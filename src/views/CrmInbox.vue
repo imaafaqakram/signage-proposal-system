@@ -16,10 +16,13 @@
         <router-link :to="{ name: 'crm-materials' }">Materials</router-link>
         <router-link :to="{ name: 'crm-vendors' }">Vendors</router-link>
         <router-link :to="{ name: 'crm-templates' }">Templates</router-link>
+        <CrmBroadcastLink />
+        <CrmTeamLink />
       </nav>
       <button class="crm-theme-toggle" @click="crmTheme.toggle()" :title="crmTheme.theme === 'pro' ? 'Switch to Light theme' : 'Switch to Pro theme'">
         <i class="fas" :class="crmTheme.theme === 'pro' ? 'fa-sun' : 'fa-moon'"></i>
       </button>
+      <CrmUserChip />
       <div class="crm-counts" v-if="counts">
         <span>{{ counts.unread }} unread</span>
         <span>{{ counts.open }} open</span>
@@ -36,6 +39,9 @@
           <button v-for="f in filters" :key="f.key"
                   :class="{ active: status === f.key }"
                   @click="status = f.key; loadThreads(true)">{{ f.label }}</button>
+          <button class="btn-sm crm-mark-all-read" :disabled="!counts || !counts.unread || markingAllRead" @click="markAllRead" title="Mark every conversation as read">
+            <i class="fas" :class="markingAllRead ? 'fa-circle-notch fa-spin' : 'fa-check-double'"></i> Mark all read
+          </button>
         </div>
 
         <div class="crm-threads" v-if="threads.length">
@@ -57,6 +63,9 @@
               <span class="ct-dir" v-if="t.last_direction">
                 <i class="fas" :class="t.last_direction === 'inbound' ? 'fa-arrow-down' : 'fa-arrow-up'"></i>
               </span>
+              <button class="ct-delete" title="Delete this conversation" @click.stop="deleteThread(t.id, t.lead_name || t.counterparty)">
+                <i class="fas fa-trash"></i>
+              </button>
             </div>
           </button>
         </div>
@@ -176,6 +185,9 @@
 <script setup>
 import { useCrmThemeStore } from '@/stores/crmThemeStore'
 import { useInboxUnread } from '@/composables/useInboxUnread'
+import CrmUserChip from '@/components/crm/CrmUserChip.vue'
+import CrmTeamLink from '@/components/crm/CrmTeamLink.vue'
+import CrmBroadcastLink from '@/components/crm/CrmBroadcastLink.vue'
 
 const crmTheme = useCrmThemeStore()
 const { unreadCount } = useInboxUnread()
@@ -207,6 +219,7 @@ const counts = ref(null)
 const loadingList = ref(false)
 const activeId = ref(null)
 const active = ref(null)
+const markingAllRead = ref(false)
 const replyBody = ref('')
 const sending = ref(false)
 const replyError = ref('')
@@ -376,6 +389,35 @@ async function openThread(id) {
     if (msgScroll.value) msgScroll.value.scrollTop = msgScroll.value.scrollHeight
   } catch (e) {
     console.error('[crm] openThread', e)
+  }
+}
+
+async function markAllRead() {
+  if (markingAllRead.value) return
+  markingAllRead.value = true
+  try {
+    await api('/threads/mark-all-read', { method: 'POST' })
+    for (const t of threads.value) t.unread_count = 0
+    counts.value = await api('/counts')
+  } catch (e) {
+    alert(e.message || 'Could not mark everything as read')
+  } finally {
+    markingAllRead.value = false
+  }
+}
+
+async function deleteThread(id, name) {
+  if (!confirm(`Delete the conversation with ${name || 'this contact'}? This can't be undone.`)) return
+  try {
+    await api(`/threads/${id}`, { method: 'DELETE' })
+    threads.value = threads.value.filter((t) => t.id !== id)
+    if (activeId.value === id) {
+      activeId.value = null
+      active.value = null
+    }
+    counts.value = await api('/counts')
+  } catch (e) {
+    alert(e.message || 'Could not delete this conversation')
   }
 }
 
@@ -616,6 +658,22 @@ onUnmounted(() => {
 .crm-filters { display: flex; padding: 8px; gap: 4px; border-bottom: 1px solid var(--crm-border-header); }
 .crm-filters button { flex: 1; background: transparent; border: 0; color: var(--crm-text-muted); font-size: 12px; font-weight: 600; padding: 6px 4px; border-radius: 5px; cursor: pointer; }
 .crm-filters button.active { background: var(--crm-hover-bg-strong); color: var(--crm-text); }
+.crm-filters .crm-mark-all-read {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  background: var(--crm-hover-bg);
+  border: 1px solid var(--crm-border-strong);
+  color: var(--crm-text-soft);
+  font-size: 11px;
+  font-weight: 600;
+  padding: 6px 10px;
+  border-radius: 6px;
+  white-space: nowrap;
+}
+.crm-filters .crm-mark-all-read:hover:not(:disabled) { background: var(--crm-hover-bg-strong); border-color: var(--crm-accent); color: var(--crm-text); }
+.crm-filters .crm-mark-all-read:disabled { opacity: .45; cursor: default; }
 
 .crm-threads { overflow-y: auto; flex: 1; }
 .crm-thread { display: block; width: 100%; text-align: left; background: transparent; border: 0; border-bottom: 1px solid var(--crm-border); padding: 11px 14px; cursor: pointer; color: inherit; }
@@ -635,6 +693,8 @@ onUnmounted(() => {
 .ct-badge.archived { background: var(--crm-warn-bg); color: var(--crm-warn); }
 .ct-unread { font-size: 10px; font-weight: 700; background: var(--crm-accent); color: var(--crm-accent-contrast); padding: 0 5px; border-radius: 8px; }
 .ct-dir { color: var(--crm-text-faint); font-size: 10px; margin-left: auto; }
+.ct-delete { background: transparent; border: 0; color: var(--crm-text-faint); font-size: 11px; padding: 2px 4px; cursor: pointer; border-radius: 4px; line-height: 1; margin-left: auto; }
+.ct-delete:hover { color: var(--crm-danger); background: var(--crm-danger-bg); }
 
 .crm-empty { padding: 40px 24px; text-align: center; color: var(--crm-text-faint); }
 .crm-empty i { font-size: 28px; opacity: .5; }

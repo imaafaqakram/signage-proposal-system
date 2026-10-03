@@ -866,3 +866,17 @@ html.theme-light {
   line-height: 1;
   vertical-align: middle;
 }
+
+/* ── CRM top bar: keep the right-hand controls on screen ──
+   With the Team link and the account chip the nav can outgrow narrower windows. Instead of
+   letting it push the theme toggle / counts / refresh button off the edge, the nav shrinks
+   and scrolls sideways, and link labels (and the unread badge) stay on one line.
+   Only .crm-top exists in the CRM views — nothing in the Proposal System uses these classes. */
+.crm-top .crm-brand { white-space: nowrap; flex: none; }
+.crm-top .crm-nav { flex: 0 1 auto; min-width: 0; overflow-x: auto; scrollbar-width: none; }
+.crm-top .crm-nav::-webkit-scrollbar { display: none; }
+.crm-top .crm-nav a { white-space: nowrap; flex: none; }
+.crm-top .crm-counts { white-space: nowrap; }
+.crm-top .crm-counts,
+.crm-top .crm-refresh,
+.crm-top .crm-theme-toggle { flex: none; }

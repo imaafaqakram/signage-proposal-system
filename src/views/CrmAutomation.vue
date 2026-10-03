@@ -14,10 +14,13 @@
         <router-link :to="{ name: 'crm-materials' }">Materials</router-link>
         <router-link :to="{ name: 'crm-vendors' }">Vendors</router-link>
         <router-link :to="{ name: 'crm-templates' }">Templates</router-link>
+        <CrmBroadcastLink />
+        <CrmTeamLink />
       </nav>
       <button class="crm-theme-toggle" @click="crmTheme.toggle()" :title="crmTheme.theme === 'pro' ? 'Switch to Light theme' : 'Switch to Pro theme'">
         <i class="fas" :class="crmTheme.theme === 'pro' ? 'fa-sun' : 'fa-moon'"></i>
       </button>
+      <CrmUserChip />
       <div class="crm-counts">
         <span v-if="summary.staleCount" class="cc-warn">{{ summary.staleCount }} gone quiet</span>
         <span>{{ summary.sentCount }} follow-ups sent</span>
@@ -232,8 +235,8 @@
           </div>
           <template v-else>
             <p class="sub">Actions across Orders, Expenses, Materials, Vendors, and stale-lead
-              dismissals, tagged with whatever name someone entered at login (optional — an honor-system
-              label, not a real account). Last {{ teamActivityDays }} days.</p>
+              dismissals, tagged with the person's name (verified when they sign in with a personal account; just an
+              unverified label if they used the shared password). The full history, with before → after values, is on the Team page. Last {{ teamActivityDays }} days.</p>
             <table class="tbl" v-if="teamActivity.length">
               <thead><tr><th>When</th><th>Who</th><th>Action</th><th>Details</th></tr></thead>
               <tbody>
@@ -259,6 +262,9 @@
 <script setup>
 import { useCrmThemeStore } from '@/stores/crmThemeStore'
 import { useInboxUnread } from '@/composables/useInboxUnread'
+import CrmUserChip from '@/components/crm/CrmUserChip.vue'
+import CrmTeamLink from '@/components/crm/CrmTeamLink.vue'
+import CrmBroadcastLink from '@/components/crm/CrmBroadcastLink.vue'
 
 const crmTheme = useCrmThemeStore()
 const { unreadCount } = useInboxUnread()

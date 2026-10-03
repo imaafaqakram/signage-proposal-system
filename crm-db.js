@@ -516,6 +516,39 @@ export async function markThreadRead(threadId) {
   if (e2.error) throw e2.error
 }
 
+// Same two writes as markThreadRead, just unscoped (every thread instead of one) —
+// a single UPDATE per table rather than looping per-thread, so this is one round
+// trip each regardless of inbox size, not N. The two updates are independent of
+// each other (different tables, no shared filter) so they run together.
+export async function markAllThreadsRead() {
+  const [e1, e2] = await Promise.all([
+    supabase.from('crm_messages').update({ is_read: true }).eq('is_read', false),
+    supabase.from('crm_threads').update({ unread_count: 0 }).gt('unread_count', 0)
+  ])
+  if (e1.error) throw e1.error
+  if (e2.error) throw e2.error
+}
+
+// Hard delete — the user explicitly asked to be able to delete a conversation, not
+// archive one. Deletes bottom-up (attachments -> messages -> thread) rather than
+// relying on an assumed ON DELETE CASCADE, since that was never confirmed for this
+// schema; explicit deletes are safe either way (a cascade just makes the later
+// deletes no-ops). Does NOT touch attachment files already on disk/Drive — only
+// removes the database rows a deleted thread would otherwise leave behind.
+export async function deleteThread(threadId) {
+  const { data: msgs, error: mErr } = await supabase.from('crm_messages').select('id').eq('thread_id', threadId)
+  if (mErr) throw mErr
+  const messageIds = (msgs || []).map((m) => m.id)
+  if (messageIds.length) {
+    const { error: aErr } = await supabase.from('crm_attachments').delete().in('message_id', messageIds)
+    if (aErr) throw aErr
+  }
+  const { error: msgDelErr } = await supabase.from('crm_messages').delete().eq('thread_id', threadId)
+  if (msgDelErr) throw msgDelErr
+  const { error: tErr } = await supabase.from('crm_threads').delete().eq('id', threadId)
+  if (tErr) throw tErr
+}
+
 export async function setThreadStatus(threadId, status) {
   const { error } = await supabase.from('crm_threads').update({ status }).eq('id', threadId)
   if (error) throw error

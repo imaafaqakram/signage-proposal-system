@@ -13,12 +13,18 @@
 // vendors.name — an untracked/ad-hoc vendor still needs to be checked against the $600
 // threshold, so that report can't just reuse this vendors-table-anchored version.
 import express from 'express'
-import { _crmSupabase as supabase, logCrmActivity } from './crm-db.js'
+import { _crmSupabase as supabase } from './crm-db.js'
+import { auditWrite } from './crm-audit.js'
+import { moneyForWrite, withFx, hasFxColumn, MoneyError } from './crm-fx.js'
 import { htmlToPdfBuffer, buildVendorsReportHtml, buildVendorsWorkbook } from './crm-reports.js'
 
 const VENDOR_COLS = 'id, name, contact_email, contact_phone, notes, created_at, updated_at'
 const PO_COLS = 'id, vendor_id, description, amount, status, order_date, expected_date, received_date, notes, created_at, updated_at'
 const PO_STATUSES = ['ordered', 'received', 'partial', 'cancelled']
+// `fx` (original currency + locked rate) only exists after migration 016 — added to selects only then.
+const poCols = () => withFx('purchase_orders', PO_COLS)
+const auditVendor = () => auditWrite({ table: 'vendors', prefix: 'vendor', entityType: 'vendor', resultKey: 'vendor', labelOf: (r) => r?.name || null })
+const auditPo = () => auditWrite({ table: 'purchase_orders', prefix: 'po', entityType: 'purchase_order', resultKey: 'purchaseOrder', labelOf: (r) => r?.description || null })
 
 // Best-effort, case-insensitive match of expenses.vendor text against a vendor name.
 // Returns { totalsByVendorName: Map<lowercased name, number>, rows: [...] } for a
@@ -64,7 +70,6 @@ export function createCrmVendorsRouter({ requireAuth } = {}) {
   const router = express.Router()
   const auth = requireAuth || ((req, res, next) => next())
   const jsonBody = express.json({ limit: '64kb' })
-  const employeeName = (req) => (req.headers['x-employee-name'] || '').toString().trim().slice(0, 80) || null
 
   router.get('/', auth, async (_req, res) => {
     try {
@@ -75,7 +80,7 @@ export function createCrmVendorsRouter({ requireAuth } = {}) {
     }
   })
 
-  router.post('/', auth, jsonBody, async (req, res) => {
+  router.post('/', auth, jsonBody, auditVendor(), async (req, res) => {
     try {
       const b = req.body || {}
       if (!b.name || !String(b.name).trim()) return res.status(400).json({ error: 'Vendor name is required' })
@@ -87,8 +92,6 @@ export function createCrmVendorsRouter({ requireAuth } = {}) {
       }
       const { data, error } = await supabase.from('vendors').insert(insert).select(VENDOR_COLS).single()
       if (error) throw error
-      const name = employeeName(req)
-      logCrmActivity({ employeeName: name, action: 'vendor.create', entityType: 'vendor', entityId: data.id })
       res.json({ ok: true, vendor: data })
     } catch (err) {
       console.error('[crm-vendors] create', err)
@@ -101,7 +104,7 @@ export function createCrmVendorsRouter({ requireAuth } = {}) {
   // shadow GET /purchase-orders, treating "purchase-orders" as a vendor id). ──
   router.get('/purchase-orders', auth, async (req, res) => {
     try {
-      let q = supabase.from('purchase_orders').select(`${PO_COLS}, vendors(name)`).order('order_date', { ascending: false }).limit(500)
+      let q = supabase.from('purchase_orders').select(`${await poCols()}, vendors(name)`).order('order_date', { ascending: false }).limit(500)
       if (req.query.status && PO_STATUSES.includes(req.query.status)) q = q.eq('status', req.query.status)
       const { data, error } = await q
       if (error) throw error
@@ -112,53 +115,61 @@ export function createCrmVendorsRouter({ requireAuth } = {}) {
     }
   })
 
-  router.post('/purchase-orders', auth, jsonBody, async (req, res) => {
+  router.post('/purchase-orders', auth, jsonBody, auditPo(), async (req, res) => {
     try {
       const b = req.body || {}
       if (!b.vendorId) return res.status(400).json({ error: 'A vendor is required' })
-      const amount = Number(b.amount)
-      if (!Number.isFinite(amount) || amount < 0) return res.status(400).json({ error: 'A valid amount is required' })
+      // `amount` is always USD (what totals sum); another currency is converted at entry
+      // and the original + locked rate kept in `fx`.
+      const money = await moneyForWrite({ table: 'purchase_orders', body: b, fields: { amount: 'amount' } })
+      if (!money || money.columns.amount === undefined) return res.status(400).json({ error: 'A valid amount is required' })
       const insert = {
         vendor_id: b.vendorId,
         description: b.description || null,
-        amount,
+        amount: money.columns.amount,
         status: PO_STATUSES.includes(b.status) ? b.status : 'ordered',
         order_date: b.orderDate || new Date().toISOString().slice(0, 10),
         expected_date: b.expectedDate || null,
         received_date: b.receivedDate || null,
         notes: b.notes || null
       }
-      const { data, error } = await supabase.from('purchase_orders').insert(insert).select(PO_COLS).single()
+      if (money.fx) insert.fx = money.fx
+      const { data, error } = await supabase.from('purchase_orders').insert(insert).select(await poCols()).single()
       if (error) throw error
-      const name = employeeName(req)
-      logCrmActivity({ employeeName: name, action: 'po.create', entityType: 'purchase_order', entityId: data.id, meta: { amount } })
       res.json({ ok: true, purchaseOrder: data })
     } catch (err) {
+      if (err instanceof MoneyError) return res.status(err.status).json({ error: err.message })
       console.error('[crm-vendors] po create', err)
       res.status(500).json({ error: err.message })
     }
   })
 
-  router.patch('/purchase-orders/:id', auth, jsonBody, async (req, res) => {
+  router.patch('/purchase-orders/:id', auth, jsonBody, auditPo(), async (req, res) => {
     try {
       const b = req.body || {}
       const patch = { updated_at: new Date().toISOString() }
       if (b.description !== undefined) patch.description = b.description
-      if (b.amount !== undefined) patch.amount = Number(b.amount)
       if (b.status !== undefined && PO_STATUSES.includes(b.status)) patch.status = b.status
       if (b.expectedDate !== undefined) patch.expected_date = b.expectedDate
       if (b.receivedDate !== undefined) patch.received_date = b.receivedDate
       if (b.notes !== undefined) patch.notes = b.notes
-      const { data, error } = await supabase.from('purchase_orders').update(patch).eq('id', req.params.id).select(PO_COLS).single()
+      const money = await moneyForWrite({ table: 'purchase_orders', body: b, fields: { amount: 'amount' }, existing: req.auditBefore })
+      if (money) {
+        Object.assign(patch, money.columns)
+        // Editing a record back to USD must clear its old foreign-currency info.
+        if (await hasFxColumn('purchase_orders')) patch.fx = money.fx
+      }
+      const { data, error } = await supabase.from('purchase_orders').update(patch).eq('id', req.params.id).select(await poCols()).single()
       if (error) throw error
       res.json({ ok: true, purchaseOrder: data })
     } catch (err) {
+      if (err instanceof MoneyError) return res.status(err.status).json({ error: err.message })
       console.error('[crm-vendors] po update', err)
       res.status(500).json({ error: err.message })
     }
   })
 
-  router.delete('/purchase-orders/:id', auth, async (req, res) => {
+  router.delete('/purchase-orders/:id', auth, auditPo(), async (req, res) => {
     try {
       const { error } = await supabase.from('purchase_orders').delete().eq('id', req.params.id)
       if (error) throw error
@@ -169,7 +180,7 @@ export function createCrmVendorsRouter({ requireAuth } = {}) {
     }
   })
 
-  router.get('/export/pdf', auth, async (_req, res) => {
+  router.get('/export/pdf', auth, async (req, res) => {
     try {
       const rows = await vendorsSummary()
       const theme = req.query.theme === 'dark' ? 'dark' : 'light'
@@ -203,7 +214,7 @@ export function createCrmVendorsRouter({ requireAuth } = {}) {
       const { data: vendor, error: vErr } = await supabase.from('vendors').select(VENDOR_COLS).eq('id', req.params.id).single()
       if (vErr) throw vErr
       const { data: pos, error: pErr } = await supabase
-        .from('purchase_orders').select(PO_COLS).eq('vendor_id', req.params.id).order('order_date', { ascending: false })
+        .from('purchase_orders').select(await poCols()).eq('vendor_id', req.params.id).order('order_date', { ascending: false })
       if (pErr) throw pErr
       const { data: expenses, error: eErr } = await supabase
         .from('expenses').select('id, description, amount, expense_date').ilike('vendor', vendor.name).order('expense_date', { ascending: false })
@@ -215,7 +226,7 @@ export function createCrmVendorsRouter({ requireAuth } = {}) {
     }
   })
 
-  router.patch('/:id', auth, jsonBody, async (req, res) => {
+  router.patch('/:id', auth, jsonBody, auditVendor(), async (req, res) => {
     try {
       const b = req.body || {}
       const patch = { updated_at: new Date().toISOString() }
@@ -232,7 +243,7 @@ export function createCrmVendorsRouter({ requireAuth } = {}) {
     }
   })
 
-  router.delete('/:id', auth, async (req, res) => {
+  router.delete('/:id', auth, auditVendor(), async (req, res) => {
     try {
       const { error } = await supabase.from('vendors').delete().eq('id', req.params.id)
       if (error) throw error

@@ -27,16 +27,48 @@ const rangeLabel = (filters) => {
 }
 
 // ── PDF ──────────────────────────────────────────────────
+const PDF_MARGIN_TOP_IN = 0.5
+const PDF_MARGIN_BOTTOM_IN = 0.6
+const PDF_MARGIN_SIDE_IN = 0.5
+const PDF_PAGE_HEIGHT_IN = 11 // Letter
+
 export async function htmlToPdfBuffer(html) {
   const browser = await puppeteer.launch({ headless: 'new', args: ['--no-sandbox', '--disable-setuid-sandbox'] })
   try {
     const page = await browser.newPage()
+    // Match the viewport to Letter's print width (8.5in @ 96dpi) before loading
+    // content, so the height measured below reflects the actual print layout
+    // rather than whatever Puppeteer's default viewport happens to be.
+    await page.setViewport({ width: 816, height: 1056 })
     await page.setContent(html, { waitUntil: 'networkidle0' })
+
+    // A short report (a handful of orders/vendors) was always rendered on a
+    // full fixed Letter page regardless of how little it actually contained —
+    // a two-row report left ~70% of the page a blank void below the table,
+    // which read as broken/unfinished rather than just short. Measure the
+    // real rendered content height (this already includes the top/bottom
+    // margin, since that's now CSS padding on body rather than a PDF-level
+    // margin — see reportShell) and, if it fits on one page, size that one
+    // page tightly to it instead. A genuinely long report (many rows) still
+    // gets real multi-page pagination at the standard Letter size — this only
+    // changes the common case where a report is shorter than a page.
+    const contentHeightPx = await page.evaluate(() => document.body.scrollHeight)
+    const neededPageHeightIn = contentHeightPx / 96
+
+    // Zero PDF-level margin everywhere: the visual margin is CSS padding on
+    // body now, which the page's own dark/light background fills right to the
+    // true page edge. A Puppeteer margin here would re-introduce the exact
+    // white gutter this was built to remove, regardless of theme.
+    const margin = { top: '0in', right: '0in', bottom: '0in', left: '0in' }
+    const pdfOptions = neededPageHeightIn <= PDF_PAGE_HEIGHT_IN
+      ? { width: '8.5in', height: `${Math.max(neededPageHeightIn, 3)}in`, printBackground: true, margin }
+      : { format: 'Letter', printBackground: true, margin }
+
     // Puppeteer's page.pdf() returns a plain Uint8Array, not a Node Buffer —
     // Express's res.send() only special-cases Buffer.isBuffer(), so an
     // unwrapped Uint8Array falls through to res.json() and gets serialized
     // as {"0":37,"1":80,...} instead of sent as raw PDF bytes.
-    const bytes = await page.pdf({ format: 'Letter', printBackground: true, margin: { top: '0.5in', right: '0.5in', bottom: '0.6in', left: '0.5in' } })
+    const bytes = await page.pdf(pdfOptions)
     return Buffer.from(bytes)
   } finally {
     await browser.close()
@@ -66,10 +98,17 @@ const resolveTheme = (theme) => THEMES[theme] || THEMES.light
 
 function reportShell(title, subtitle, bodyHtml, theme = 'light') {
   const t = resolveTheme(theme)
+  // The page margin lives here as CSS padding on body, NOT as Puppeteer's own
+  // page.pdf({ margin }) option (see htmlToPdfBuffer, which now passes zero
+  // margin there) — Chrome's PDF margin gutter is blank/white by definition,
+  // outside the page's own painted content, so it ignores html/body's dark
+  // background entirely. That's what produced a white border around an
+  // otherwise-black report. Padding is part of body's own box, so the
+  // background fills it — no white edge, in any theme.
   return `<!DOCTYPE html><html><head><meta charset="utf-8"><style>
     * { box-sizing: border-box; }
     html, body { background: ${t.bg}; }
-    body { font-family: -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif; color: ${t.ink}; margin: 0; padding: 0; font-size: 12px; }
+    body { font-family: -apple-system, 'Segoe UI', Helvetica, Arial, sans-serif; color: ${t.ink}; margin: 0; padding: ${PDF_MARGIN_TOP_IN}in ${PDF_MARGIN_SIDE_IN}in ${PDF_MARGIN_BOTTOM_IN}in; font-size: 12px; }
     .hd { display: flex; justify-content: space-between; align-items: flex-end; border-bottom: 3px solid ${t.accent}; padding-bottom: 14px; margin-bottom: 22px; }
     .hd-brand { font-size: 22px; font-weight: 800; letter-spacing: .3px; display: flex; align-items: center; gap: 8px; }
     .hd-brand .dot { width: 10px; height: 10px; border-radius: 50%; background: ${t.accent}; box-shadow: 0 0 0 4px ${t.accentSoft}; }

@@ -9,10 +9,14 @@
 
 import express from 'express'
 import { _crmSupabase as supabase } from './crm-db.js'
+import { auditWrite } from './crm-audit.js'
 
 const TABLE = 'crm_reply_templates'
 
 const clean = (v) => (v == null ? '' : String(v).trim())
+
+// Who created / edited / deleted which template (crm-audit.js — never affects the response).
+const audit = () => auditWrite({ table: TABLE, prefix: 'template', entityType: 'template', labelOf: (r) => r?.name || null })
 
 export function createCrmTemplatesRouter({ requireAuth } = {}) {
   const router = express.Router()
@@ -38,7 +42,7 @@ export function createCrmTemplatesRouter({ requireAuth } = {}) {
   })
 
   // ── POST /  — create ─────────────────────────────────────
-  router.post('/', jsonBody, async (req, res) => {
+  router.post('/', jsonBody, audit(), async (req, res) => {
     try {
       const name = clean(req.body?.name)
       const body = clean(req.body?.body)
@@ -59,7 +63,7 @@ export function createCrmTemplatesRouter({ requireAuth } = {}) {
   })
 
   // ── PATCH /:id  — update name and/or body ─────────────────
-  router.patch('/:id', jsonBody, async (req, res) => {
+  router.patch('/:id', jsonBody, audit(), async (req, res) => {
     try {
       const id = Number(req.params.id)
       if (!Number.isFinite(id)) return res.status(400).json({ error: 'bad id' })
@@ -96,7 +100,7 @@ export function createCrmTemplatesRouter({ requireAuth } = {}) {
   })
 
   // ── DELETE /:id ──────────────────────────────────────────
-  router.delete('/:id', async (req, res) => {
+  router.delete('/:id', audit(), async (req, res) => {
     try {
       const id = Number(req.params.id)
       if (!Number.isFinite(id)) return res.status(400).json({ error: 'bad id' })

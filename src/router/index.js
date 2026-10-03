@@ -123,6 +123,23 @@ const routes = [
     name: 'crm-vendors',
     component: () => import('@/views/CrmVendors.vue'),
     meta: { requiresAuth: true }
+  },
+  {
+    path: '/crm/broadcast',
+    name: 'crm-broadcast',
+    // Admin-only, like /crm/team: requiresAuth is the outer gate, the page's own admin check
+    // (personal admin account, or the admin password on the shared login) is the real one.
+    component: () => import('@/views/CrmBroadcast.vue'),
+    meta: { requiresAuth: true }
+  },
+  {
+    path: '/crm/team',
+    name: 'crm-team',
+    // Same pattern as /crm/orders: requiresAuth is the outer gate, the page's own
+    // admin check (personal admin account, or the admin password on the shared login)
+    // is the real one.
+    component: () => import('@/views/CrmTeam.vue'),
+    meta: { requiresAuth: true }
   }
 ]
 

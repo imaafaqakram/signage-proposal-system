@@ -14,10 +14,13 @@
         <router-link :to="{ name: 'crm-materials' }">Materials</router-link>
         <router-link :to="{ name: 'crm-vendors' }">Vendors</router-link>
         <router-link :to="{ name: 'crm-templates' }">Templates</router-link>
+        <CrmBroadcastLink />
+        <CrmTeamLink />
       </nav>
       <button class="crm-theme-toggle" @click="crmTheme.toggle()" :title="crmTheme.theme === 'pro' ? 'Switch to Light theme' : 'Switch to Pro theme'">
         <i class="fas" :class="crmTheme.theme === 'pro' ? 'fa-sun' : 'fa-moon'"></i>
       </button>
+      <CrmUserChip />
       <div class="crm-counts" v-if="adminAuth.isAuthenticated">
         <span>{{ money(summary.revenue) }} revenue</span>
         <span>{{ summary.count }} orders</span>
@@ -33,6 +36,8 @@
         <div class="lock-card">
           <i class="fas fa-lock lock-icon"></i>
           <h2>Orders</h2>
+          <p v-if="isEmployeeOnly">Your account is an employee account, so this page is limited to admins. Ask an admin if you need access.</p>
+          <template v-else>
           <p>Revenue and order records — admin password required.</p>
           <form class="gate-form" @submit.prevent="unlockAdmin">
             <input v-model="adminPassword" :type="showAdminPassword ? 'text' : 'password'" placeholder="Admin password" />
@@ -40,6 +45,7 @@
             <button type="submit" :disabled="adminAuth.loading">Unlock</button>
           </form>
           <p v-if="adminError" class="err-text">{{ adminError }}</p>
+          </template>
         </div>
       </div>
 
@@ -74,13 +80,14 @@
             <tbody>
               <tr v-for="r in rows" :key="r.id">
                 <td class="muted small">{{ fmtDate(r.order_date) }}</td>
-                <td>{{ r.client_name }}<div v-if="r.client_email" class="sub-email">{{ r.client_email }}</div></td>
+                <td>{{ r.client_name }}<div v-if="r.client_email" class="sub-email">{{ r.client_email }}</div><div v-if="who(r.id)" class="who">{{ who(r.id) }}</div></td>
                 <td class="muted">{{ r.description || '—' }}</td>
                 <td><span class="status-badge" :class="'st-' + r.status">{{ r.status }}</span></td>
-                <td class="num">{{ money(r.amount_charged) }}</td>
-                <td class="num muted">{{ money(r.sales_tax) }}</td>
+                <td class="num">{{ money(r.amount_charged) }}<div v-if="r.fx && r.fx.original && r.fx.original.amount_charged != null" class="orig">{{ formatOriginal(r.fx.currency, r.fx.original.amount_charged) }}</div></td>
+                <td class="num muted">{{ money(r.sales_tax) }}<div v-if="r.fx && r.fx.original && r.fx.original.sales_tax" class="orig">{{ formatOriginal(r.fx.currency, r.fx.original.sales_tax) }}</div></td>
                 <td class="num" style="font-weight:700">{{ money(r.total_amount) }}</td>
                 <td class="right">
+                  <button class="btn-sm btn-hist" title="History — who changed this" aria-label="History" @click="openHistory('order', r.id, `${r.client_name} · ${money(r.total_amount)}`)"><i class="fas fa-clock-rotate-left"></i></button>
                   <button class="btn-sm" @click="openEdit(r)">Edit</button>
                   <button class="btn-sm warn" @click="removeOrder(r)" style="margin-left:6px">Delete</button>
                 </td>
@@ -118,26 +125,24 @@
         </div>
         <div class="fg"><label>Description</label><input v-model="form.description" placeholder="e.g. 3D Acrylic Front-lit, 36x24in" class="finp" style="width:100%" /></div>
 
-        <div class="modal-grid">
-          <div class="fg">
-            <label>Amount Charged * <span v-if="suggestedAmount" class="suggest-hint">(suggested ${{ suggestedAmount }} from their proposal — verify before saving)</span></label>
-            <input v-model.number="form.amountCharged" type="number" step="0.01" class="finp" style="width:100%" />
-          </div>
-          <div class="fg"><label>Sales Tax</label><input v-model.number="form.salesTax" type="number" step="0.01" class="finp" style="width:100%" /></div>
+        <div class="fg">
+          <label>Amount Charged * <span v-if="suggestedAmount" class="suggest-hint">(suggested ${{ suggestedAmount }} from their proposal — verify before saving)</span></label>
+          <MoneyInput v-model="form.amountCharged" v-model:currency="form.currency" v-model:fxRate="form.fxRate" v-model:fxManual="form.fxManual" />
         </div>
         <div class="modal-grid">
+          <div class="fg"><label>Sales Tax</label><MoneyInput v-model="form.salesTax" :currency="form.currency" :fx-rate="form.fxRate" :show-picker="false" compact /></div>
           <div class="fg"><label>Status</label>
             <select v-model="form.status" class="finp" style="width:100%">
               <option value="paid">Paid</option><option value="pending">Pending</option>
               <option value="partial">Partial</option><option value="refunded">Refunded</option>
             </select>
           </div>
-          <div class="fg"><label>Payment Method</label><input v-model="form.paymentMethod" placeholder="e.g. card, wire, cash" class="finp" style="width:100%" /></div>
         </div>
         <div class="modal-grid">
+          <div class="fg"><label>Payment Method</label><input v-model="form.paymentMethod" placeholder="e.g. card, wire, cash" class="finp" style="width:100%" /></div>
           <div class="fg"><label>Order Date</label><input v-model="form.orderDate" type="date" class="finp" style="width:100%" /></div>
-          <div class="fg"><label>Notes</label><input v-model="form.notes" class="finp" style="width:100%" /></div>
         </div>
+        <div class="fg"><label>Notes</label><input v-model="form.notes" class="finp" style="width:100%" /></div>
 
         <p v-if="formError" class="err-text">{{ formError }}</p>
         <div class="modal-actions">
@@ -146,18 +151,33 @@
         </div>
       </div>
     </div>
+    <HistoryModal v-if="historyFor" :entity-type="historyFor.type" :entity-id="historyFor.id" :title="historyFor.title" admin @close="historyFor = null" />
   </div>
 </template>
 
 <script setup>
 import { useCrmThemeStore } from '@/stores/crmThemeStore'
 import { useInboxUnread } from '@/composables/useInboxUnread'
+import CrmUserChip from '@/components/crm/CrmUserChip.vue'
+import CrmTeamLink from '@/components/crm/CrmTeamLink.vue'
+import CrmBroadcastLink from '@/components/crm/CrmBroadcastLink.vue'
 
 const crmTheme = useCrmThemeStore()
 const { unreadCount } = useInboxUnread()
 import { ref, reactive, onMounted, computed } from 'vue'
 import { useAdminAuthStore } from '@/stores/adminAuthStore'
 import { employeeNameHeader } from '@/services/crmActivity'
+import MoneyInput from '@/components/crm/MoneyInput.vue'
+import HistoryModal from '@/components/crm/HistoryModal.vue'
+import { formatOriginal } from '@/composables/useFx'
+import { useCrmUser } from '@/composables/useCrmUser'
+import { useAttribution } from '@/composables/useAttribution'
+
+const { isEmployeeOnly } = useCrmUser()
+const historyFor = ref(null)
+const attribution = useAttribution('order')
+const who = attribution.text
+function openHistory(type, id, title) { historyFor.value = { type, id, title } }
 
 const adminAuth = useAdminAuthStore()
 const adminPassword = ref('')
@@ -205,6 +225,7 @@ async function loadRows(reset = true) {
     rows.value = reset ? r : [...rows.value, ...r]
     total.value = t
     offset += r.length
+    attribution.load(r.map((x) => x.id))
   } catch (e) { console.error('[crm-orders] load', e) } finally { loading.value = false }
 }
 function loadMore() { loadRows(false) }
@@ -240,10 +261,10 @@ const suggestedAmount = ref(null)
 const leadSearch = ref('')
 const leadResults = ref([])
 let leadTimer = null
-const form = reactive({ leadId: null, clientName: '', clientEmail: '', description: '', amountCharged: null, salesTax: 0, status: 'paid', paymentMethod: '', orderDate: new Date().toISOString().slice(0, 10), notes: '' })
+const form = reactive({ leadId: null, clientName: '', clientEmail: '', description: '', amountCharged: null, salesTax: 0, status: 'paid', paymentMethod: '', orderDate: new Date().toISOString().slice(0, 10), notes: '', currency: 'USD', fxRate: null, fxManual: false })
 
 function resetForm() {
-  Object.assign(form, { leadId: null, clientName: '', clientEmail: '', description: '', amountCharged: null, salesTax: 0, status: 'paid', paymentMethod: '', orderDate: new Date().toISOString().slice(0, 10), notes: '' })
+  Object.assign(form, { leadId: null, clientName: '', clientEmail: '', description: '', amountCharged: null, salesTax: 0, status: 'paid', paymentMethod: '', orderDate: new Date().toISOString().slice(0, 10), notes: '', currency: 'USD', fxRate: null, fxManual: false })
   leadSearch.value = ''; leadResults.value = []; suggestedAmount.value = null; formError.value = ''
 }
 function openNew() { resetForm(); editingId.value = null; modalOpen.value = true }
@@ -252,7 +273,10 @@ function openEdit(r) {
   editingId.value = r.id
   Object.assign(form, {
     leadId: r.lead_id, clientName: r.client_name, clientEmail: r.client_email || '', description: r.description || '',
-    amountCharged: Number(r.amount_charged), salesTax: Number(r.sales_tax), status: r.status,
+    amountCharged: r.fx?.original?.amount_charged != null ? Number(r.fx.original.amount_charged) : Number(r.amount_charged),
+    salesTax: r.fx?.original?.sales_tax != null ? Number(r.fx.original.sales_tax) : Number(r.sales_tax),
+    currency: r.fx?.currency || 'USD', fxRate: r.fx?.rate ?? null, fxManual: !!r.fx?.manual,
+    status: r.status,
     paymentMethod: r.payment_method || '', orderDate: r.order_date, notes: r.notes || ''
   })
   modalOpen.value = true
@@ -405,4 +429,7 @@ onMounted(async () => {
 .linked-lead { margin-top: 6px; font-size: 11.5px; color: var(--crm-success); display: flex; align-items: center; gap: 8px; }
 .btn-icon { background: none; border: none; color: var(--crm-text-muted); cursor: pointer; font-size: 12px; }
 .modal-actions { display: flex; gap: 10px; margin-top: 16px; }
+.orig { font-size: 10.5px; font-weight: 500; color: var(--crm-text-muted); margin-top: 2px; }
+.who { font-size: 10.5px; color: var(--crm-text-dim); margin-top: 3px; font-weight: 500; }
+.btn-hist { padding: 7px 9px; margin-right: 6px; }
 </style>

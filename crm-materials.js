@@ -11,15 +11,20 @@
 // convention of keeping logic in the app layer, not Postgres (no triggers/RLS anywhere
 // else here either). There is deliberately no way to PATCH quantity_on_hand directly.
 import express from 'express'
-import { _crmSupabase as supabase, logCrmActivity } from './crm-db.js'
+import { _crmSupabase as supabase } from './crm-db.js'
+import { auditWrite, getActor, logEvent } from './crm-audit.js'
+import { moneyForWrite, withFx, hasFxColumn, MoneyError } from './crm-fx.js'
 import { htmlToPdfBuffer, buildMaterialsReportHtml, buildMaterialsWorkbook } from './crm-reports.js'
 
 const MATERIAL_COLS = 'id, name, category, unit, unit_cost, quantity_on_hand, reorder_threshold, notes, created_at, updated_at'
 const CATEGORIES = ['acrylic', 'led', 'vinyl', 'hardware', 'metal', 'other']
 const REASONS = ['purchase', 'used_on_order', 'adjustment', 'waste']
+// `fx` (original currency + locked rate) only exists after migration 016 — added to selects only then.
+const materialCols = () => withFx('materials', MATERIAL_COLS)
+const audit = () => auditWrite({ table: 'materials', prefix: 'material', entityType: 'material', resultKey: 'material', labelOf: (r) => r?.name || null })
 
 async function fetchMaterials({ lowStock }) {
-  let q = supabase.from('materials').select(MATERIAL_COLS).order('name', { ascending: true })
+  let q = supabase.from('materials').select(await materialCols()).order('name', { ascending: true })
   const { data, error } = await q
   if (error) throw error
   let rows = data || []
@@ -40,7 +45,8 @@ export function createCrmMaterialsRouter({ requireAuth } = {}) {
   const router = express.Router()
   const auth = requireAuth || ((req, res, next) => next())
   const jsonBody = express.json({ limit: '64kb' })
-  const employeeName = (req) => (req.headers['x-employee-name'] || '').toString().trim().slice(0, 80) || null
+  // Who did it — the signed-in person when using a personal login, else the shared-login name tag.
+  const employeeName = (req) => getActor(req).name
 
   router.get('/', auth, async (req, res) => {
     try {
@@ -61,49 +67,60 @@ export function createCrmMaterialsRouter({ requireAuth } = {}) {
     }
   })
 
-  router.post('/', auth, jsonBody, async (req, res) => {
+  router.post('/', auth, jsonBody, audit(), async (req, res) => {
     try {
       const b = req.body || {}
       if (!b.name || !String(b.name).trim()) return res.status(400).json({ error: 'Name is required' })
       if (!CATEGORIES.includes(b.category)) return res.status(400).json({ error: 'Invalid category' })
+      // unit_cost is always USD (inventory value = qty x unit_cost); another currency is
+      // converted at entry and the original + locked rate kept in `fx`.
+      const money = await moneyForWrite({ table: 'materials', body: b, fields: { unitCost: 'unit_cost' } })
       const insert = {
         name: String(b.name).trim(),
         category: b.category,
         unit: b.unit ? String(b.unit).trim() : 'each',
-        unit_cost: Number(b.unitCost) || 0,
+        unit_cost: money?.columns.unit_cost ?? 0,
         quantity_on_hand: Number(b.quantityOnHand) || 0,
         reorder_threshold: Number(b.reorderThreshold) || 0,
         notes: b.notes || null
       }
-      const { data, error } = await supabase.from('materials').insert(insert).select(MATERIAL_COLS).single()
+      if (money?.fx) insert.fx = money.fx
+      const { data, error } = await supabase.from('materials').insert(insert).select(await materialCols()).single()
       if (error) throw error
       res.json({ ok: true, material: data })
     } catch (err) {
+      if (err instanceof MoneyError) return res.status(err.status).json({ error: err.message })
       console.error('[crm-materials] create', err)
       res.status(500).json({ error: err.message })
     }
   })
 
-  router.patch('/:id', auth, jsonBody, async (req, res) => {
+  router.patch('/:id', auth, jsonBody, audit(), async (req, res) => {
     try {
       const b = req.body || {}
       const patch = { updated_at: new Date().toISOString() }
       if (b.name !== undefined) patch.name = String(b.name).trim()
       if (b.category !== undefined && CATEGORIES.includes(b.category)) patch.category = b.category
       if (b.unit !== undefined) patch.unit = b.unit
-      if (b.unitCost !== undefined) patch.unit_cost = Number(b.unitCost)
       if (b.reorderThreshold !== undefined) patch.reorder_threshold = Number(b.reorderThreshold)
       if (b.notes !== undefined) patch.notes = b.notes
-      const { data, error } = await supabase.from('materials').update(patch).eq('id', req.params.id).select(MATERIAL_COLS).single()
+      const money = await moneyForWrite({ table: 'materials', body: b, fields: { unitCost: 'unit_cost' }, existing: req.auditBefore })
+      if (money) {
+        Object.assign(patch, money.columns)
+        // Editing a record back to USD must clear its old foreign-currency info.
+        if (await hasFxColumn('materials')) patch.fx = money.fx
+      }
+      const { data, error } = await supabase.from('materials').update(patch).eq('id', req.params.id).select(await materialCols()).single()
       if (error) throw error
       res.json({ ok: true, material: data })
     } catch (err) {
+      if (err instanceof MoneyError) return res.status(err.status).json({ error: err.message })
       console.error('[crm-materials] update', err)
       res.status(500).json({ error: err.message })
     }
   })
 
-  router.delete('/:id', auth, async (req, res) => {
+  router.delete('/:id', auth, audit(), async (req, res) => {
     try {
       const { error } = await supabase.from('materials').delete().eq('id', req.params.id)
       if (error) throw error
@@ -144,11 +161,11 @@ export function createCrmMaterialsRouter({ requireAuth } = {}) {
         .from('materials')
         .update({ quantity_on_hand: newQty, updated_at: new Date().toISOString() })
         .eq('id', req.params.id)
-        .select(MATERIAL_COLS)
+        .select(await materialCols())
         .single()
       if (upErr) throw upErr
 
-      logCrmActivity({ employeeName: name, action: 'material.adjust', entityType: 'material', entityId: req.params.id, meta: { delta, reason: b.reason } })
+      logEvent(req, { action: 'material.adjust', entityType: 'material', entityId: req.params.id, meta: { label: updated?.name || null, delta, reason: b.reason, detail: `Stock ${delta > 0 ? '+' : ''}${delta} (${b.reason}) → ${newQty} on hand` } })
       res.json({ ok: true, material: updated })
     } catch (err) {
       console.error('[crm-materials] adjust', err)

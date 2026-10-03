@@ -14,10 +14,13 @@
         <router-link :to="{ name: 'crm-materials' }">Materials</router-link>
         <router-link :to="{ name: 'crm-vendors' }">Vendors</router-link>
         <router-link :to="{ name: 'crm-templates' }">Templates</router-link>
+        <CrmBroadcastLink />
+        <CrmTeamLink />
       </nav>
       <button class="crm-theme-toggle" @click="crmTheme.toggle()" :title="crmTheme.theme === 'pro' ? 'Switch to Light theme' : 'Switch to Pro theme'">
         <i class="fas" :class="crmTheme.theme === 'pro' ? 'fa-sun' : 'fa-moon'"></i>
       </button>
+      <CrmUserChip />
       <div class="crm-counts" v-if="adminAuth.isAuthenticated">
         <span>{{ summary.itemCount }} items</span>
         <span :style="summary.lowStockCount ? 'color:var(--crm-danger)' : ''">{{ summary.lowStockCount }} low stock</span>
@@ -33,6 +36,8 @@
         <div class="lock-card">
           <i class="fas fa-lock lock-icon"></i>
           <h2>Materials</h2>
+          <p v-if="isEmployeeOnly">Your account is an employee account, so this page is limited to admins. Ask an admin if you need access.</p>
+          <template v-else>
           <p>Inventory levels and stock value — admin password required.</p>
           <form class="gate-form" @submit.prevent="unlockAdmin">
             <input v-model="adminPassword" :type="showAdminPassword ? 'text' : 'password'" placeholder="Admin password" />
@@ -40,6 +45,7 @@
             <button type="submit" :disabled="adminAuth.loading">Unlock</button>
           </form>
           <p v-if="adminError" class="err-text">{{ adminError }}</p>
+          </template>
         </div>
       </div>
 
@@ -64,14 +70,15 @@
             <thead><tr><th>Name</th><th>Category</th><th>Unit</th><th class="num">Qty</th><th class="num">Reorder At</th><th class="num">Unit Cost</th><th class="num">Value</th><th></th></tr></thead>
             <tbody>
               <tr v-for="r in filteredRows" :key="r.id" :class="{ 'low-row': isLow(r) }">
-                <td>{{ r.name }}</td>
+                <td>{{ r.name }}<div v-if="who(r.id)" class="who">{{ who(r.id) }}</div></td>
                 <td class="muted">{{ catLabel(r.category) }}</td>
                 <td class="muted">{{ r.unit }}</td>
                 <td class="num" :style="isLow(r) ? 'color:var(--crm-danger);font-weight:700' : ''">{{ num(r.quantity_on_hand) }}</td>
                 <td class="num muted">{{ num(r.reorder_threshold) }}</td>
-                <td class="num muted">{{ money(r.unit_cost) }}</td>
+                <td class="num muted">{{ money(r.unit_cost) }}<div v-if="r.fx && r.fx.original && r.fx.original.unit_cost != null" class="orig">{{ formatOriginal(r.fx.currency, r.fx.original.unit_cost) }}</div></td>
                 <td class="num" style="font-weight:700">{{ money(r.quantity_on_hand * r.unit_cost) }}</td>
                 <td class="right">
+                  <button class="btn-sm btn-hist" title="History — who changed this" aria-label="History" @click="openHistory('material', r.id, r.name)"><i class="fas fa-clock-rotate-left"></i></button>
                   <button class="btn-sm" @click="openAdjust(r)">Adjust</button>
                   <button class="btn-sm" @click="openEdit(r)" style="margin-left:6px">Edit</button>
                   <button class="btn-sm warn" @click="removeMaterial(r)" style="margin-left:6px">Delete</button>
@@ -100,11 +107,11 @@
           </div>
           <div class="fg"><label>Unit</label><input v-model="form.unit" placeholder="sheet, roll, ft, each…" class="finp" style="width:100%" /></div>
         </div>
+        <div class="fg"><label>Unit Cost</label><MoneyInput v-model="form.unitCost" v-model:currency="form.currency" v-model:fxRate="form.fxRate" v-model:fxManual="form.fxManual" /></div>
         <div class="modal-grid">
-          <div class="fg"><label>Unit Cost</label><input v-model.number="form.unitCost" type="number" step="0.01" class="finp" style="width:100%" /></div>
           <div class="fg"><label>Reorder Threshold</label><input v-model.number="form.reorderThreshold" type="number" step="1" class="finp" style="width:100%" /></div>
+          <div v-if="!editingId" class="fg"><label>Starting Quantity</label><input v-model.number="form.quantityOnHand" type="number" step="1" class="finp" style="width:100%" /></div>
         </div>
-        <div v-if="!editingId" class="fg"><label>Starting Quantity</label><input v-model.number="form.quantityOnHand" type="number" step="1" class="finp" style="width:100%" /></div>
         <div class="fg"><label>Notes</label><input v-model="form.notes" class="finp" style="width:100%" /></div>
         <p v-if="formError" class="err-text">{{ formError }}</p>
         <div class="modal-actions">
@@ -138,18 +145,33 @@
         </div>
       </div>
     </div>
+    <HistoryModal v-if="historyFor" :entity-type="historyFor.type" :entity-id="historyFor.id" :title="historyFor.title" admin @close="historyFor = null" />
   </div>
 </template>
 
 <script setup>
 import { useCrmThemeStore } from '@/stores/crmThemeStore'
 import { useInboxUnread } from '@/composables/useInboxUnread'
+import CrmUserChip from '@/components/crm/CrmUserChip.vue'
+import CrmTeamLink from '@/components/crm/CrmTeamLink.vue'
+import CrmBroadcastLink from '@/components/crm/CrmBroadcastLink.vue'
 
 const crmTheme = useCrmThemeStore()
 const { unreadCount } = useInboxUnread()
 import { ref, reactive, computed, onMounted } from 'vue'
 import { useAdminAuthStore } from '@/stores/adminAuthStore'
 import { employeeNameHeader } from '@/services/crmActivity'
+import MoneyInput from '@/components/crm/MoneyInput.vue'
+import HistoryModal from '@/components/crm/HistoryModal.vue'
+import { formatOriginal } from '@/composables/useFx'
+import { useCrmUser } from '@/composables/useCrmUser'
+import { useAttribution } from '@/composables/useAttribution'
+
+const { isEmployeeOnly } = useCrmUser()
+const historyFor = ref(null)
+const attribution = useAttribution('material')
+const who = attribution.text
+function openHistory(type, id, title) { historyFor.value = { type, id, title } }
 
 const adminAuth = useAdminAuthStore()
 const adminPassword = ref('')
@@ -191,6 +213,7 @@ async function loadRows() {
   try {
     const { rows: r } = await api(`/${lowStockOnly.value ? '?lowStock=true' : ''}`)
     rows.value = r
+    attribution.load(r.map((x) => x.id))
   } catch (e) { console.error('[crm-materials] load', e) } finally { loading.value = false }
 }
 async function loadSummary() {
@@ -219,17 +242,22 @@ async function exportFile(kind) {
 const modalOpen = ref(false)
 const editingId = ref(null)
 const formError = ref('')
-const form = reactive({ name: '', category: 'acrylic', unit: 'each', unitCost: 0, reorderThreshold: 0, quantityOnHand: 0, notes: '' })
+const form = reactive({ name: '', category: 'acrylic', unit: 'each', unitCost: 0, reorderThreshold: 0, quantityOnHand: 0, notes: '', currency: 'USD', fxRate: null, fxManual: false })
 
 function resetForm() {
-  Object.assign(form, { name: '', category: 'acrylic', unit: 'each', unitCost: 0, reorderThreshold: 0, quantityOnHand: 0, notes: '' })
+  Object.assign(form, { name: '', category: 'acrylic', unit: 'each', unitCost: 0, reorderThreshold: 0, quantityOnHand: 0, notes: '', currency: 'USD', fxRate: null, fxManual: false })
   formError.value = ''
 }
 function openNew() { resetForm(); editingId.value = null; modalOpen.value = true }
 function openEdit(r) {
   resetForm()
   editingId.value = r.id
-  Object.assign(form, { name: r.name, category: r.category, unit: r.unit, unitCost: Number(r.unit_cost), reorderThreshold: Number(r.reorder_threshold), notes: r.notes || '' })
+  Object.assign(form, {
+    name: r.name, category: r.category, unit: r.unit,
+    unitCost: r.fx?.original?.unit_cost != null ? Number(r.fx.original.unit_cost) : Number(r.unit_cost),
+    reorderThreshold: Number(r.reorder_threshold), notes: r.notes || '',
+    currency: r.fx?.currency || 'USD', fxRate: r.fx?.rate ?? null, fxManual: !!r.fx?.manual
+  })
   modalOpen.value = true
 }
 function closeModal() { modalOpen.value = false }
@@ -353,4 +381,7 @@ onMounted(async () => {
 .fg { display: flex; flex-direction: column; gap: 5px; margin-bottom: 12px; }
 .fg label { font-size: 10.5px; font-weight: 700; letter-spacing: .5px; text-transform: uppercase; color: var(--crm-text-muted); }
 .modal-actions { display: flex; gap: 10px; margin-top: 16px; }
+.orig { font-size: 10.5px; font-weight: 500; color: var(--crm-text-muted); margin-top: 2px; }
+.who { font-size: 10.5px; color: var(--crm-text-dim); margin-top: 3px; font-weight: 500; }
+.btn-hist { padding: 7px 9px; margin-right: 6px; }
 </style>

@@ -31,7 +31,8 @@
 // Self-contained like every other CRM module: only touches crm-db.js's shared Supabase
 // client, and only ever writes the single follow_up_stopped_at column on `leads`.
 import express from 'express'
-import { _crmSupabase as supabase, logCrmActivity, markLeadContacted } from './crm-db.js'
+import { _crmSupabase as supabase, markLeadContacted } from './crm-db.js'
+import { logEvent } from './crm-audit.js'
 
 const LEAD_COLS = 'id, client_name, contact_email, email_sent_at, follow_up_stopped_at, follow_up_count, follow_up_last_sent_at'
 
@@ -110,17 +111,18 @@ async function fetchStaleResponded(term) {
   if (!stale.length) return []
 
   const leadIds = stale.map((r) => r.lead_id)
-  const { data: leads, error: lErr } = await supabase
-    .from('leads').select('id, client_name, contact_email').in('id', leadIds)
+  // Both independent — same leadIds, different tables — run together rather
+  // than one after the other.
+  const [{ data: leads, error: lErr }, { data: threads, error: tErr }] = await Promise.all([
+    supabase.from('leads').select('id, client_name, contact_email').in('id', leadIds),
+    // Most recent thread per lead, so the UI can deep-link straight into the right
+    // conversation (CrmInbox.vue already auto-opens ?thread=<id> on load).
+    supabase.from('crm_threads').select('id, lead_id, last_message_at')
+      .in('lead_id', leadIds).order('last_message_at', { ascending: false })
+  ])
   if (lErr) throw lErr
-  const leadMap = new Map((leads || []).map((l) => [l.id, l]))
-
-  // Most recent thread per lead, so the UI can deep-link straight into the right
-  // conversation (CrmInbox.vue already auto-opens ?thread=<id> on load).
-  const { data: threads, error: tErr } = await supabase
-    .from('crm_threads').select('id, lead_id, last_message_at')
-    .in('lead_id', leadIds).order('last_message_at', { ascending: false })
   if (tErr) throw tErr
+  const leadMap = new Map((leads || []).map((l) => [l.id, l]))
   const threadMap = new Map()
   for (const t of threads || []) if (!threadMap.has(t.lead_id)) threadMap.set(t.lead_id, t.id)
 
@@ -152,17 +154,25 @@ export function createCrmAutomationRouter({ requireAuth, requireAdmin } = {}) {
   // purpose (those need the admin session; the frontend fetches them separately).
   router.get('/summary', auth, async (_req, res) => {
     try {
-      const { count: dncCount, error: e1 } = await supabase
-        .from('leads').select('*', { count: 'exact', head: true }).not('follow_up_stopped_at', 'is', null)
+      // Four fully independent reads (three counts + the stale list) run together
+      // instead of one after another — each round trip to Supabase from this VM
+      // runs ~200-300ms, so four sequential awaits here was ~1s of pure network
+      // wait before this page's numbers ever showed up.
+      const [
+        { count: dncCount, error: e1 },
+        { count: candidateCount, error: e2 },
+        { count: sentCount, error: e3 },
+        staleRows
+      ] = await Promise.all([
+        supabase.from('leads').select('*', { count: 'exact', head: true }).not('follow_up_stopped_at', 'is', null),
+        supabase.from('leads').select('*', { count: 'exact', head: true })
+          .not('email_sent_at', 'is', null).is('follow_up_stopped_at', null),
+        supabase.from('leads').select('*', { count: 'exact', head: true }).gt('follow_up_count', 0),
+        fetchStaleResponded('')
+      ])
       if (e1) throw e1
-      const { count: candidateCount, error: e2 } = await supabase
-        .from('leads').select('*', { count: 'exact', head: true })
-        .not('email_sent_at', 'is', null).is('follow_up_stopped_at', null)
       if (e2) throw e2
-      const { count: sentCount, error: e3 } = await supabase
-        .from('leads').select('*', { count: 'exact', head: true }).gt('follow_up_count', 0)
       if (e3) throw e3
-      const staleRows = await fetchStaleResponded('')
       res.json({ dncCount: dncCount || 0, candidateCount: candidateCount || 0, sentCount: sentCount || 0, staleCount: staleRows.length })
     } catch (err) {
       console.error('[crm-automation] summary', err)
@@ -248,6 +258,7 @@ export function createCrmAutomationRouter({ requireAuth, requireAdmin } = {}) {
         .eq('id', id)
         .is('follow_up_stopped_at', null)
       if (error) throw error
+      logEvent(req, { action: 'lead.follow-up-stop', entityType: 'lead', entityId: id, meta: { detail: 'Added to the Do-Not-Contact list' } })
       res.json({ ok: true })
     } catch (err) {
       console.error('[crm-automation] stop', err)
@@ -262,6 +273,7 @@ export function createCrmAutomationRouter({ requireAuth, requireAdmin } = {}) {
       if (!Number.isFinite(id)) return res.status(400).json({ error: 'bad id' })
       const { error } = await supabase.from('leads').update({ follow_up_stopped_at: null }).eq('id', id)
       if (error) throw error
+      logEvent(req, { action: 'lead.follow-up-resume', entityType: 'lead', entityId: id, meta: { detail: 'Taken off the Do-Not-Contact list' } })
       res.json({ ok: true })
     } catch (err) {
       console.error('[crm-automation] resume', err)
@@ -302,8 +314,7 @@ export function createCrmAutomationRouter({ requireAuth, requireAdmin } = {}) {
         return res.status(503).json({ error: 'Not available yet — a pending database migration needs to be run first.' })
       }
       if (error) throw error
-      const name = (req.headers['x-employee-name'] || '').toString().trim().slice(0, 80) || null
-      logCrmActivity({ employeeName: name, action: 'stale.dismiss', entityType: 'lead', entityId: id })
+      logEvent(req, { action: 'stale.dismiss', entityType: 'lead', entityId: id })
       res.json({ ok: true })
     } catch (err) {
       console.error('[crm-automation] dismiss-stale', err)
@@ -356,8 +367,7 @@ export function createCrmAutomationRouter({ requireAuth, requireAdmin } = {}) {
 
       await markLeadContacted(id).catch((e) => console.warn('[crm-automation] send-followup markLeadContacted failed:', e.message))
 
-      const name = (req.headers['x-employee-name'] || '').toString().trim().slice(0, 80) || null
-      logCrmActivity({ employeeName: name, action: 'stale.send-followup', entityType: 'lead', entityId: id })
+      logEvent(req, { action: 'stale.send-followup', entityType: 'lead', entityId: id, meta: { label: lead.client_name || null, detail: `Sent follow-up #${followUpNumber} to ${lead.contact_email}` } })
       res.json({ ok: true, followUpNumber })
     } catch (err) {
       console.error('[crm-automation] send-followup', err)

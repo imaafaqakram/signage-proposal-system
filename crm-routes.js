@@ -17,9 +17,12 @@ import {
   listThreads,
   getThread,
   markThreadRead,
+  markAllThreadsRead,
+  deleteThread,
   setThreadStatus,
   inboxCounts
 } from './crm-db.js'
+import { logEvent } from './crm-audit.js'
 
 const smtp = () =>
   nodemailer.createTransport({
@@ -213,6 +216,36 @@ export function createCrmRouter({ requireAuth } = {}) {
     }
   })
 
+  // POST /threads/mark-all-read — one click clears every unread badge in the
+  // inbox at once, instead of opening each thread individually.
+  router.post('/threads/mark-all-read', auth, async (req, res) => {
+    try {
+      await markAllThreadsRead()
+      logEvent(req, { action: 'inbox.mark-all-read', entityType: 'thread', entityId: null })
+      res.json({ ok: true })
+    } catch (err) {
+      console.error('[crm] mark-all-read', err)
+      res.status(500).json({ error: err.message })
+    }
+  })
+
+  // DELETE /threads/:id — permanent, not an archive (setThreadStatus('archived')
+  // already covers "hide it but keep it"; this is for when someone actually wants
+  // it gone). The frontend is expected to confirm with the user before calling
+  // this — nothing here asks again.
+  router.delete('/threads/:id', auth, async (req, res) => {
+    try {
+      const id = Number(req.params.id)
+      if (!Number.isFinite(id)) return res.status(400).json({ error: 'bad id' })
+      await deleteThread(id)
+      logEvent(req, { action: 'thread.delete', entityType: 'thread', entityId: id })
+      res.json({ ok: true })
+    } catch (err) {
+      console.error('[crm] delete thread', err)
+      res.status(500).json({ error: err.message })
+    }
+  })
+
   router.post('/threads/:id/status', auth, express.json(), async (req, res) => {
     try {
       const status = (req.body?.status || '').trim()
@@ -220,6 +253,7 @@ export function createCrmRouter({ requireAuth } = {}) {
         return res.status(400).json({ error: 'bad status' })
       }
       await setThreadStatus(req.params.id, status)
+      logEvent(req, { action: 'thread.status', entityType: 'thread', entityId: req.params.id, meta: { detail: `Marked the conversation ${status}` } })
       res.json({ ok: true })
     } catch (err) {
       res.status(500).json({ error: err.message })
@@ -287,6 +321,7 @@ export function createCrmRouter({ requireAuth } = {}) {
         sentAt: new Date().toISOString()
       })
 
+      logEvent(req, { action: 'thread.reply', entityType: 'thread', entityId: thread.id, meta: { label: subject, detail: `Emailed ${to}` } })
       res.json({ ok: true, messageId: sentId, ...logged })
     } catch (err) {
       console.error('[crm] reply error:', err)

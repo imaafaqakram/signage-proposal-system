@@ -6,7 +6,9 @@
 //
 //   app.use('/api/crm/expenses', createCrmExpensesRouter({ requireAuth: requireAdmin }))
 import express from 'express'
-import { _crmSupabase as supabase, logCrmActivity } from './crm-db.js'
+import { _crmSupabase as supabase } from './crm-db.js'
+import { auditWrite } from './crm-audit.js'
+import { moneyForWrite, withFx, hasFxColumn, MoneyError } from './crm-fx.js'
 import { fetchOrdersSummary } from './crm-orders.js'
 import {
   htmlToPdfBuffer,
@@ -20,6 +22,10 @@ import {
 
 const EXPENSE_COLS = 'id, category, description, amount, vendor, expense_date, notes, created_at, updated_at'
 const CATEGORIES = ['ad_spend', 'shipping', 'tax', 'materials', 'software', 'other']
+// `fx` (original currency + locked rate) only exists after migration 016 — added to selects only then.
+const expenseCols = () => withFx('expenses', EXPENSE_COLS)
+const expenseLabel = (r) => [r?.description, r?.vendor].filter(Boolean).join(' · ') || null
+const audit = (extra = {}) => auditWrite({ table: 'expenses', prefix: 'expense', entityType: 'expense', resultKey: 'expense', labelOf: expenseLabel, ...extra })
 
 function parseFilters(query) {
   const filters = {}
@@ -122,7 +128,7 @@ export function createCrmExpensesRouter({ requireAuth } = {}) {
       const limit = Math.min(200, Math.max(1, parseInt(req.query.limit, 10) || 50))
       const offset = Math.max(0, parseInt(req.query.offset, 10) || 0)
       const filters = parseFilters(req.query)
-      let q = supabase.from('expenses').select(EXPENSE_COLS, { count: 'exact' }).order('expense_date', { ascending: false }).range(offset, offset + limit - 1)
+      let q = supabase.from('expenses').select(await expenseCols(), { count: 'exact' }).order('expense_date', { ascending: false }).range(offset, offset + limit - 1)
       q = applyFilters(q, filters)
       const { data, count, error } = await q
       if (error) throw error
@@ -142,52 +148,60 @@ export function createCrmExpensesRouter({ requireAuth } = {}) {
     }
   })
 
-  router.post('/', auth, jsonBody, async (req, res) => {
+  router.post('/', auth, jsonBody, audit(), async (req, res) => {
     try {
       const b = req.body || {}
       if (!CATEGORIES.includes(b.category)) return res.status(400).json({ error: 'A valid category is required' })
-      const amount = Number(b.amount)
-      if (!Number.isFinite(amount) || amount < 0) return res.status(400).json({ error: 'A valid amount is required' })
+      const money = await moneyForWrite({ table: 'expenses', body: b, fields: { amount: 'amount' } })
+      if (!money || money.columns.amount === undefined) return res.status(400).json({ error: 'A valid amount is required' })
 
+      // `amount` is always USD (what every total/report sums). If it was typed in another
+      // currency, the original amount + locked rate ride along in `fx`.
       const insert = {
         category: b.category,
         description: b.description ? String(b.description).trim() : null,
-        amount,
+        amount: money.columns.amount,
         vendor: b.vendor ? String(b.vendor).trim() : null,
         expense_date: b.expenseDate || new Date().toISOString().slice(0, 10),
         notes: b.notes || null
       }
-      const { data, error } = await supabase.from('expenses').insert(insert).select(EXPENSE_COLS).single()
+      if (money.fx) insert.fx = money.fx
+      const { data, error } = await supabase.from('expenses').insert(insert).select(await expenseCols()).single()
       if (error) throw error
-      const employeeName = (req.headers['x-employee-name'] || '').toString().trim().slice(0, 80) || null
-      logCrmActivity({ employeeName, action: 'expense.create', entityType: 'expense', entityId: data.id, meta: { amount } })
       res.json({ ok: true, expense: data })
     } catch (err) {
+      if (err instanceof MoneyError) return res.status(err.status).json({ error: err.message })
       console.error('[crm-expenses] create', err)
       res.status(500).json({ error: err.message })
     }
   })
 
-  router.patch('/:id', auth, jsonBody, async (req, res) => {
+  router.patch('/:id', auth, jsonBody, audit(), async (req, res) => {
     try {
       const b = req.body || {}
       const patch = { updated_at: new Date().toISOString() }
       if (b.category !== undefined && CATEGORIES.includes(b.category)) patch.category = b.category
       if (b.description !== undefined) patch.description = b.description
-      if (b.amount !== undefined) patch.amount = Number(b.amount)
       if (b.vendor !== undefined) patch.vendor = b.vendor
       if (b.expenseDate !== undefined) patch.expense_date = b.expenseDate
       if (b.notes !== undefined) patch.notes = b.notes
-      const { data, error } = await supabase.from('expenses').update(patch).eq('id', req.params.id).select(EXPENSE_COLS).single()
+      const money = await moneyForWrite({ table: 'expenses', body: b, fields: { amount: 'amount' }, existing: req.auditBefore })
+      if (money) {
+        patch.amount = money.columns.amount
+        // Editing a record back to USD must clear its old foreign-currency info.
+        if (await hasFxColumn('expenses')) patch.fx = money.fx
+      }
+      const { data, error } = await supabase.from('expenses').update(patch).eq('id', req.params.id).select(await expenseCols()).single()
       if (error) throw error
       res.json({ ok: true, expense: data })
     } catch (err) {
+      if (err instanceof MoneyError) return res.status(err.status).json({ error: err.message })
       console.error('[crm-expenses] update', err)
       res.status(500).json({ error: err.message })
     }
   })
 
-  router.delete('/:id', auth, async (req, res) => {
+  router.delete('/:id', auth, audit(), async (req, res) => {
     try {
       const { error } = await supabase.from('expenses').delete().eq('id', req.params.id)
       if (error) throw error
@@ -201,7 +215,7 @@ export function createCrmExpensesRouter({ requireAuth } = {}) {
   router.get('/export/pdf', auth, async (req, res) => {
     try {
       const filters = parseFilters(req.query)
-      let q = supabase.from('expenses').select(EXPENSE_COLS).order('expense_date', { ascending: false }).limit(5000)
+      let q = supabase.from('expenses').select(await expenseCols()).order('expense_date', { ascending: false }).limit(5000)
       q = applyFilters(q, filters)
       const [{ data: rows, error }, summary] = await Promise.all([q, expensesSummary(filters)])
       if (error) throw error
@@ -219,7 +233,7 @@ export function createCrmExpensesRouter({ requireAuth } = {}) {
   router.get('/export/excel', auth, async (req, res) => {
     try {
       const filters = parseFilters(req.query)
-      let q = supabase.from('expenses').select(EXPENSE_COLS).order('expense_date', { ascending: false }).limit(5000)
+      let q = supabase.from('expenses').select(await expenseCols()).order('expense_date', { ascending: false }).limit(5000)
       q = applyFilters(q, filters)
       const [{ data: rows, error }, summary] = await Promise.all([q, expensesSummary(filters)])
       if (error) throw error
@@ -266,7 +280,7 @@ export function createCrmExpensesRouter({ requireAuth } = {}) {
       let oq = supabase.from('orders').select('order_date, client_name, description, amount_charged, sales_tax, total_amount').order('order_date', { ascending: false }).limit(5000)
       if (filters.from) oq = oq.gte('order_date', filters.from)
       if (filters.to) oq = oq.lte('order_date', filters.to)
-      let eq = supabase.from('expenses').select(EXPENSE_COLS).order('expense_date', { ascending: false }).limit(5000)
+      let eq = supabase.from('expenses').select(await expenseCols()).order('expense_date', { ascending: false }).limit(5000)
       eq = applyFilters(eq, filters)
       const [{ data: orderRows, error: oErr }, { data: expenseRows, error: eErr }, orders, expenses] = await Promise.all([
         oq, eq, fetchOrdersSummary(filters), expensesSummary(filters)

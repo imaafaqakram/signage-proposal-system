@@ -295,7 +295,7 @@
     <div v-if="showSavedLeadsPanel" class="px-3 py-2.5 border-b border-gray-700 bg-gray-800/60">
       <div class="flex items-center justify-between mb-1.5">
         <span class="text-[10px] uppercase tracking-wider text-gray-400 font-bold">
-          Saved Leads ({{ savedLeads.length }})
+          Saved Leads ({{ savedLeadsQuery.trim() ? `${filteredSavedLeads.length} of ${savedLeads.length}` : savedLeads.length }})
         </span>
         <div class="flex items-center gap-2">
           <button @click="loadSavedLeadsList" :disabled="savedLeadsLoading" class="text-gray-400 hover:text-gray-200" title="Refresh">
@@ -307,12 +307,28 @@
         </div>
       </div>
 
+      <div v-if="savedLeads.length > 0" class="relative mb-1.5">
+        <i class="fas fa-magnifying-glass absolute left-2 top-1/2 -translate-y-1/2 text-[9px] text-gray-500"></i>
+        <input
+          v-model="savedLeadsQuery"
+          type="text"
+          placeholder="Search by name or email…"
+          class="w-full bg-gray-900 border border-gray-700 rounded text-[10px] text-gray-200 placeholder-gray-500 pl-6 pr-6 py-1.5 focus:outline-none focus:border-cyan-500"
+        />
+        <button v-if="savedLeadsQuery" @click="savedLeadsQuery = ''" class="absolute right-2 top-1/2 -translate-y-1/2 text-gray-500 hover:text-gray-300" title="Clear search">
+          <i class="fas fa-times text-[9px]"></i>
+        </button>
+      </div>
+
       <p v-if="!savedLeadsLoading && savedLeads.length === 0" class="text-[10px] text-gray-500">
         Nothing saved yet — fetch a lead or click Save to start building this list.
       </p>
+      <p v-else-if="!savedLeadsLoading && filteredSavedLeads.length === 0" class="text-[10px] text-gray-500">
+        No saved leads match "{{ savedLeadsQuery }}".
+      </p>
 
       <div v-else class="max-h-64 overflow-y-auto space-y-1">
-        <div v-for="lead in savedLeads" :key="lead.id" class="bg-gray-900 rounded">
+        <div v-for="lead in filteredSavedLeads" :key="lead.id" class="bg-gray-900 rounded">
           <div class="flex items-center gap-2 px-2 py-1.5 text-[11px]">
             <button @click="handleLoadSavedLead(lead.id, 'latest')" class="flex-1 min-w-0 text-left text-gray-200 hover:text-white">
               <div class="truncate flex items-center gap-1.5">
@@ -1355,9 +1371,19 @@ const handleBulkAction = async (action) => {
 const savingLead = ref(false)
 const showSavedLeadsPanel = ref(false)
 const savedLeads = ref([])
+const savedLeadsQuery = ref('')
 const savedLeadsLoading = ref(false)
 const expandedLeadId = ref(null)
 const leadVersions = ref([])
+const filteredSavedLeads = computed(() => {
+  const q = savedLeadsQuery.value.trim().toLowerCase()
+  if (!q) return savedLeads.value
+  return savedLeads.value.filter((l) =>
+    (l.clientName || '').toLowerCase().includes(q) ||
+    (l.contactEmail || '').toLowerCase().includes(q) ||
+    (l.crmSourceAlias || '').toLowerCase().includes(q)
+  )
+})
 
 const formatSavedDate = (iso) => {
   if (!iso) return ''

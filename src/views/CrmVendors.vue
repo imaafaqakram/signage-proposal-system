@@ -14,10 +14,13 @@
         <router-link :to="{ name: 'crm-materials' }">Materials</router-link>
         <router-link :to="{ name: 'crm-vendors' }">Vendors</router-link>
         <router-link :to="{ name: 'crm-templates' }">Templates</router-link>
+        <CrmBroadcastLink />
+        <CrmTeamLink />
       </nav>
       <button class="crm-theme-toggle" @click="crmTheme.toggle()" :title="crmTheme.theme === 'pro' ? 'Switch to Light theme' : 'Switch to Pro theme'">
         <i class="fas" :class="crmTheme.theme === 'pro' ? 'fa-sun' : 'fa-moon'"></i>
       </button>
+      <CrmUserChip />
       <div class="crm-counts" v-if="adminAuth.isAuthenticated">
         <span>{{ rows.length }} vendors</span>
         <span>{{ money(totalPaid) }} total paid</span>
@@ -33,6 +36,8 @@
         <div class="lock-card">
           <i class="fas fa-lock lock-icon"></i>
           <h2>Vendors</h2>
+          <p v-if="isEmployeeOnly">Your account is an employee account, so this page is limited to admins. Ask an admin if you need access.</p>
+          <template v-else>
           <p>Vendor payments and purchase orders — admin password required.</p>
           <form class="gate-form" @submit.prevent="unlockAdmin">
             <input v-model="adminPassword" :type="showAdminPassword ? 'text' : 'password'" placeholder="Admin password" />
@@ -40,6 +45,7 @@
             <button type="submit" :disabled="adminAuth.loading">Unlock</button>
           </form>
           <p v-if="adminError" class="err-text">{{ adminError }}</p>
+          </template>
         </div>
       </div>
 
@@ -66,11 +72,12 @@
               <template v-for="v in filteredRows" :key="v.id">
                 <tr class="clickable" @click="toggleExpand(v)">
                   <td><i class="fas" :class="expanded === v.id ? 'fa-chevron-down' : 'fa-chevron-right'" style="font-size:10px;color:var(--crm-text-dim)"></i></td>
-                  <td>{{ v.name }}</td>
+                  <td>{{ v.name }}<div v-if="who(v.id)" class="who">{{ who(v.id) }}</div></td>
                   <td class="muted">{{ v.contact_email || v.contact_phone || '—' }}</td>
                   <td class="num" style="font-weight:700">{{ money(v.totalPaid) }}</td>
                   <td class="num" :style="v.openPOs ? 'color:var(--crm-warn)' : ''">{{ v.openPOs }}</td>
                   <td class="right" @click.stop>
+                    <button class="btn-sm btn-hist" title="History — who changed this" aria-label="History" @click="openHistory('vendor', v.id, v.name)"><i class="fas fa-clock-rotate-left"></i></button>
                     <button class="btn-sm" @click="openEditVendor(v)">Edit</button>
                     <button class="btn-sm warn" @click="removeVendor(v)" style="margin-left:6px">Delete</button>
                   </td>
@@ -85,7 +92,7 @@
                           <div v-for="po in detail.purchaseOrders" :key="po.id" class="detail-row">
                             <span>{{ fmtDate(po.order_date) }}</span>
                             <span class="muted">{{ po.description || '—' }}</span>
-                            <span class="num">{{ money(po.amount) }}</span>
+                            <span class="num">{{ money(po.amount) }}<span v-if="po.fx && po.fx.original" class="orig" style="display:block">{{ formatOriginal(po.fx.currency, po.fx.original.amount) }}</span></span>
                             <span class="status-badge" :class="'st-' + po.status">{{ po.status }}</span>
                           </div>
                         </div>
@@ -146,14 +153,12 @@
           </select>
         </div>
         <div class="fg"><label>Description</label><input v-model="poForm.description" class="finp" style="width:100%" /></div>
-        <div class="modal-grid">
-          <div class="fg"><label>Amount *</label><input v-model.number="poForm.amount" type="number" step="0.01" class="finp" style="width:100%" /></div>
-          <div class="fg"><label>Status</label>
-            <select v-model="poForm.status" class="finp" style="width:100%">
-              <option value="ordered">Ordered</option><option value="received">Received</option>
-              <option value="partial">Partial</option><option value="cancelled">Cancelled</option>
-            </select>
-          </div>
+        <div class="fg"><label>Amount *</label><MoneyInput v-model="poForm.amount" v-model:currency="poForm.currency" v-model:fxRate="poForm.fxRate" v-model:fxManual="poForm.fxManual" /></div>
+        <div class="fg"><label>Status</label>
+          <select v-model="poForm.status" class="finp" style="width:100%">
+            <option value="ordered">Ordered</option><option value="received">Received</option>
+            <option value="partial">Partial</option><option value="cancelled">Cancelled</option>
+          </select>
         </div>
         <div class="modal-grid">
           <div class="fg"><label>Order Date</label><input v-model="poForm.orderDate" type="date" class="finp" style="width:100%" /></div>
@@ -166,18 +171,33 @@
         </div>
       </div>
     </div>
+    <HistoryModal v-if="historyFor" :entity-type="historyFor.type" :entity-id="historyFor.id" :title="historyFor.title" admin @close="historyFor = null" />
   </div>
 </template>
 
 <script setup>
 import { useCrmThemeStore } from '@/stores/crmThemeStore'
 import { useInboxUnread } from '@/composables/useInboxUnread'
+import CrmUserChip from '@/components/crm/CrmUserChip.vue'
+import CrmTeamLink from '@/components/crm/CrmTeamLink.vue'
+import CrmBroadcastLink from '@/components/crm/CrmBroadcastLink.vue'
 
 const crmTheme = useCrmThemeStore()
 const { unreadCount } = useInboxUnread()
 import { ref, reactive, computed, onMounted } from 'vue'
 import { useAdminAuthStore } from '@/stores/adminAuthStore'
 import { employeeNameHeader } from '@/services/crmActivity'
+import MoneyInput from '@/components/crm/MoneyInput.vue'
+import HistoryModal from '@/components/crm/HistoryModal.vue'
+import { formatOriginal } from '@/composables/useFx'
+import { useCrmUser } from '@/composables/useCrmUser'
+import { useAttribution } from '@/composables/useAttribution'
+
+const { isEmployeeOnly } = useCrmUser()
+const historyFor = ref(null)
+const attribution = useAttribution('vendor')
+const who = attribution.text
+function openHistory(type, id, title) { historyFor.value = { type, id, title } }
 
 const adminAuth = useAdminAuthStore()
 const adminPassword = ref('')
@@ -210,7 +230,7 @@ function fmtDate(iso) { return iso ? new Date(iso).toLocaleDateString([], { year
 
 async function loadAll() {
   loading.value = true
-  try { const { rows: r } = await api('/'); rows.value = r } catch (e) { console.error('[crm-vendors] load', e) } finally { loading.value = false }
+  try { const { rows: r } = await api('/'); rows.value = r; attribution.load(r.map((x) => x.id)) } catch (e) { console.error('[crm-vendors] load', e) } finally { loading.value = false }
 }
 
 async function exportFile(kind) {
@@ -273,9 +293,9 @@ async function removeVendor(v) {
 // ── PO modal ──
 const poModalOpen = ref(false)
 const poFormError = ref('')
-const poForm = reactive({ vendorId: '', description: '', amount: null, status: 'ordered', orderDate: new Date().toISOString().slice(0, 10), expectedDate: '' })
+const poForm = reactive({ vendorId: '', description: '', amount: null, status: 'ordered', orderDate: new Date().toISOString().slice(0, 10), expectedDate: '', currency: 'USD', fxRate: null, fxManual: false })
 function openNewPO() {
-  Object.assign(poForm, { vendorId: '', description: '', amount: null, status: 'ordered', orderDate: new Date().toISOString().slice(0, 10), expectedDate: '' })
+  Object.assign(poForm, { vendorId: '', description: '', amount: null, status: 'ordered', orderDate: new Date().toISOString().slice(0, 10), expectedDate: '', currency: 'USD', fxRate: null, fxManual: false })
   poFormError.value = ''; poModalOpen.value = true
 }
 async function savePO() {
@@ -382,4 +402,7 @@ onMounted(async () => {
 .fg { display: flex; flex-direction: column; gap: 5px; margin-bottom: 12px; }
 .fg label { font-size: 10.5px; font-weight: 700; letter-spacing: .5px; text-transform: uppercase; color: var(--crm-text-muted); }
 .modal-actions { display: flex; gap: 10px; margin-top: 16px; }
+.orig { font-size: 10.5px; font-weight: 500; color: var(--crm-text-muted); margin-top: 2px; }
+.who { font-size: 10.5px; color: var(--crm-text-dim); margin-top: 3px; font-weight: 500; }
+.btn-hist { padding: 7px 9px; margin-right: 6px; }
 </style>

@@ -59,21 +59,28 @@ async function selectAll(build) {
  * array of { id, owner, last_activity_at } ordered newest-first (leads.id desc).
  */
 async function computeBuckets() {
+  // Steps 1 and 2 don't depend on each other — the status fetch reads every
+  // crm_lead_status row regardless of the leads working set, filtering against
+  // it only happens after both are in hand — so they run together instead of
+  // one after the other. Each round trip to Supabase from this VM runs
+  // ~200-300ms, so every sequential await here was real, felt latency.
+
   // 1. Bounded working set: the newest BOARD_LEAD_CAP lead ids.
-  const { data: leadRows, error: leadErr } = await supabase
+  const leadRowsPromise = supabase
     .from('leads')
     .select('id')
     .order('id', { ascending: false })
     .limit(BOARD_LEAD_CAP)
+
+  // 2. Every crm_lead_status row, paged in 1000-row chunks.
+  const statusRowsPromise = selectAll(() =>
+    supabase.from('crm_lead_status').select('lead_id, stage, owner, last_activity_at'),
+  )
+
+  const [{ data: leadRows, error: leadErr }, statusRows] = await Promise.all([leadRowsPromise, statusRowsPromise])
   if (leadErr) throw leadErr
   const leadIds = (leadRows || []).map((r) => r.id)
   const inWorkingSet = new Set(leadIds)
-
-  // 2. Every crm_lead_status row, paged in 1000-row chunks; keep the ones that
-  //    fall inside the working set.
-  const statusRows = await selectAll(() =>
-    supabase.from('crm_lead_status').select('lead_id, stage, owner, last_activity_at'),
-  )
   const statusByLead = new Map()
   for (const r of statusRows) {
     if (r.lead_id != null && inWorkingSet.has(r.lead_id)) statusByLead.set(r.lead_id, r)

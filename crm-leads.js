@@ -12,6 +12,7 @@
 import express from 'express'
 import fs from 'node:fs'
 import { _crmSupabase as supabase } from './crm-db.js'
+import { logEvent } from './crm-audit.js'
 
 const STAGES = ['new', 'contacted', 'responded', 'negotiating', 'won', 'lost']
 const NON_NEW = STAGES.filter((s) => s !== 'new')
@@ -133,16 +134,13 @@ export function createCrmLeadsRouter({ requireAuth } = {}) {
         return query
       }
 
-      // total — exact; the stage id-list keeps it exact here
+      // total and the page/candidate fetch are independent — both just read
+      // `leads` under the same filters — so they run together instead of one
+      // after the other. On this VM's connection to Supabase (~200-300ms per
+      // round trip, geographically distant) every sequential await here is real,
+      // felt latency, not just a code-cleanliness nit — this cut the default
+      // page load from 4 sequential round trips down to 2.
       let total = 0
-      {
-        const { count, error } = await applyFilters(
-          supabase.from('leads').select('id', { count: 'exact', head: true })
-        )
-        if (error) throw error
-        total = count || 0
-      }
-
       const cols = 'id, client_name, contact_email, crm_lead_date, created_at, email_sent_at'
       let pageRows = []
       let statusMap = null
@@ -150,11 +148,18 @@ export function createCrmLeadsRouter({ requireAuth } = {}) {
       if (sort === 'activity') {
         // last_activity_at is on crm_lead_status — pull a capped candidate window,
         // join status in memory, order (nulls last), then slice the page.
-        const { data, error } = await applyFilters(supabase.from('leads').select(cols))
-          .order('created_at', { ascending: false })
-          .limit(ACTIVITY_SCAN_CAP)
-        if (error) throw error
+        const [{ count, error: countErr }, { data, error: dataErr }] = await Promise.all([
+          applyFilters(supabase.from('leads').select('id', { count: 'exact', head: true })),
+          applyFilters(supabase.from('leads').select(cols))
+            .order('created_at', { ascending: false })
+            .limit(ACTIVITY_SCAN_CAP)
+        ])
+        if (countErr) throw countErr
+        if (dataErr) throw dataErr
+        total = count || 0
         const cands = data || []
+        // Needed before slicing (sort depends on it) — a real dependency, stays
+        // sequential. Reused below instead of re-fetched for the final page ids.
         statusMap = await fetchStatusMap(cands.map((l) => l.id))
         cands.sort((a, b) => {
           const av = statusMap.get(a.id)?.last_activity_at
@@ -166,20 +171,27 @@ export function createCrmLeadsRouter({ requireAuth } = {}) {
         })
         pageRows = cands.slice(offset, offset + limit)
       } else {
-        const { data, error } = await applyFilters(supabase.from('leads').select(cols))
-          .order('created_at', { ascending: false })
-          .range(offset, offset + limit - 1)
-        if (error) throw error
+        const [{ count, error: countErr }, { data, error: dataErr }] = await Promise.all([
+          applyFilters(supabase.from('leads').select('id', { count: 'exact', head: true })),
+          applyFilters(supabase.from('leads').select(cols))
+            .order('created_at', { ascending: false })
+            .range(offset, offset + limit - 1)
+        ])
+        if (countErr) throw countErr
+        if (dataErr) throw dataErr
+        total = count || 0
         pageRows = data || []
       }
 
       const ids = pageRows.map((l) => l.id)
-      if (!statusMap) statusMap = await fetchStatusMap(ids)
-      const [aliasMap, threadSet, pdfSet] = await Promise.all([
+      const knownStatusMap = statusMap
+      const [aliasMap, threadSet, pdfSet, resolvedStatusMap] = await Promise.all([
         fetchLatestAliasMap(ids),
         fetchLeadIdSet('crm_threads', ids),
-        fetchLeadIdSet('crm_attachments', ids, (query) => query.eq('kind', 'proposal-pdf'))
+        fetchLeadIdSet('crm_attachments', ids, (query) => query.eq('kind', 'proposal-pdf')),
+        knownStatusMap ? Promise.resolve(knownStatusMap) : fetchStatusMap(ids)
       ])
+      statusMap = resolvedStatusMap
 
       const leads = pageRows.map((l) => {
         const st = statusMap.get(l.id) || null
@@ -395,7 +407,7 @@ export function createCrmLeadsRouter({ requireAuth } = {}) {
 
       const { data: lead, error: lErr } = await supabase
         .from('leads')
-        .select('id')
+        .select('id, client_name')
         .eq('id', id)
         .maybeSingle()
       if (lErr) throw lErr
@@ -430,6 +442,13 @@ export function createCrmLeadsRouter({ requireAuth } = {}) {
       }
 
       if (patch.stage) await autoStopFollowUpsIfClosed(id, patch.stage)
+
+      // History: who moved this lead / changed its owner (crm-audit.js; never throws).
+      const changes = {}
+      const prevStage = existing?.stage ?? 'new'
+      if (patch.stage !== undefined && patch.stage !== prevStage) changes.stage = { from: prevStage, to: patch.stage }
+      if (patch.owner !== undefined && (patch.owner ?? null) !== (existing?.owner ?? null)) changes.owner = { from: existing?.owner ?? null, to: patch.owner ?? null }
+      if (Object.keys(changes).length) logEvent(req, { action: 'lead.update', entityType: 'lead', entityId: id, meta: { label: lead.client_name || null, changes } })
 
       res.json(row)
     } catch (err) {

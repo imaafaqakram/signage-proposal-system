@@ -14,10 +14,13 @@
         <router-link :to="{ name: 'crm-materials' }">Materials</router-link>
         <router-link :to="{ name: 'crm-vendors' }">Vendors</router-link>
         <router-link :to="{ name: 'crm-templates' }">Templates</router-link>
+        <CrmBroadcastLink />
+        <CrmTeamLink />
       </nav>
       <button class="crm-theme-toggle" @click="crmTheme.toggle()" :title="crmTheme.theme === 'pro' ? 'Switch to Light theme' : 'Switch to Pro theme'">
         <i class="fas" :class="crmTheme.theme === 'pro' ? 'fa-sun' : 'fa-moon'"></i>
       </button>
+      <CrmUserChip />
       <div class="crm-counts" v-if="adminAuth.isAuthenticated">
         <span :style="{ color: netProfit >= 0 ? 'var(--crm-success)' : 'var(--crm-danger)' }">{{ money(netProfit) }} net</span>
       </div>
@@ -32,6 +35,8 @@
         <div class="lock-card">
           <i class="fas fa-lock lock-icon"></i>
           <h2>Finance</h2>
+          <p v-if="isEmployeeOnly">Your account is an employee account, so this page is limited to admins. Ask an admin if you need access.</p>
+          <template v-else>
           <p>Expenses, revenue and net profit — admin password required.</p>
           <form class="gate-form" @submit.prevent="unlockAdmin">
             <input v-model="adminPassword" :type="showAdminPassword ? 'text' : 'password'" placeholder="Admin password" />
@@ -39,6 +44,7 @@
             <button type="submit" :disabled="adminAuth.loading">Unlock</button>
           </form>
           <p v-if="adminError" class="err-text">{{ adminError }}</p>
+          </template>
         </div>
       </div>
 
@@ -134,10 +140,11 @@
               <tr v-for="r in rows" :key="r.id">
                 <td class="muted small">{{ fmtDate(r.expense_date) }}</td>
                 <td><span class="cat-badge">{{ catLabel(r.category) }}</span></td>
-                <td class="muted">{{ r.description || '—' }}</td>
+                <td class="muted">{{ r.description || '—' }}<div v-if="who(r.id)" class="who">{{ who(r.id) }}</div></td>
                 <td class="muted">{{ r.vendor || '—' }}</td>
-                <td class="num" style="font-weight:700">{{ money(r.amount) }}</td>
+                <td class="num" style="font-weight:700">{{ money(r.amount) }}<div v-if="r.fx && r.fx.original" class="orig">{{ formatOriginal(r.fx.currency, r.fx.original.amount) }}</div></td>
                 <td class="right">
+                  <button class="btn-sm btn-hist" title="History — who changed this" aria-label="History" @click="openHistory('expense', r.id, `${catLabel(r.category)} · ${r.description || r.vendor || money(r.amount)}`)"><i class="fas fa-clock-rotate-left"></i></button>
                   <button class="btn-sm" @click="openEdit(r)">Edit</button>
                   <button class="btn-sm warn" @click="removeExpense(r)" style="margin-left:6px">Delete</button>
                 </td>
@@ -167,14 +174,14 @@
               <option value="software">Software</option><option value="other">Other</option>
             </select>
           </div>
-          <div class="fg"><label>Amount *</label><input v-model.number="form.amount" type="number" step="0.01" class="finp" style="width:100%" /></div>
+          <div class="fg"><label>Date</label><input v-model="form.expenseDate" type="date" class="finp" style="width:100%" /></div>
         </div>
+        <div class="fg"><label>Amount *</label><MoneyInput v-model="form.amount" v-model:currency="form.currency" v-model:fxRate="form.fxRate" v-model:fxManual="form.fxManual" /></div>
         <div class="fg"><label>Description</label><input v-model="form.description" class="finp" style="width:100%" /></div>
         <div class="modal-grid">
           <div class="fg"><label>Vendor</label><input v-model="form.vendor" class="finp" style="width:100%" /></div>
-          <div class="fg"><label>Date</label><input v-model="form.expenseDate" type="date" class="finp" style="width:100%" /></div>
+          <div class="fg"><label>Notes</label><input v-model="form.notes" class="finp" style="width:100%" /></div>
         </div>
-        <div class="fg"><label>Notes</label><input v-model="form.notes" class="finp" style="width:100%" /></div>
 
         <p v-if="formError" class="err-text">{{ formError }}</p>
         <div class="modal-actions">
@@ -183,18 +190,33 @@
         </div>
       </div>
     </div>
+    <HistoryModal v-if="historyFor" :entity-type="historyFor.type" :entity-id="historyFor.id" :title="historyFor.title" admin @close="historyFor = null" />
   </div>
 </template>
 
 <script setup>
 import { useCrmThemeStore } from '@/stores/crmThemeStore'
 import { useInboxUnread } from '@/composables/useInboxUnread'
+import CrmUserChip from '@/components/crm/CrmUserChip.vue'
+import CrmTeamLink from '@/components/crm/CrmTeamLink.vue'
+import CrmBroadcastLink from '@/components/crm/CrmBroadcastLink.vue'
 
 const crmTheme = useCrmThemeStore()
 const { unreadCount } = useInboxUnread()
 import { ref, reactive, onMounted, computed } from 'vue'
 import { useAdminAuthStore } from '@/stores/adminAuthStore'
 import { employeeNameHeader } from '@/services/crmActivity'
+import MoneyInput from '@/components/crm/MoneyInput.vue'
+import HistoryModal from '@/components/crm/HistoryModal.vue'
+import { formatOriginal } from '@/composables/useFx'
+import { useCrmUser } from '@/composables/useCrmUser'
+import { useAttribution } from '@/composables/useAttribution'
+
+const { isEmployeeOnly } = useCrmUser()
+const historyFor = ref(null)
+const attribution = useAttribution('expense')
+const who = attribution.text
+function openHistory(type, id, title) { historyFor.value = { type, id, title } }
 
 const adminAuth = useAdminAuthStore()
 const adminPassword = ref('')
@@ -249,6 +271,7 @@ async function loadRows(reset = true) {
     rows.value = reset ? r : [...rows.value, ...r]
     total.value = t
     offset += r.length
+    attribution.load(r.map((x) => x.id))
   } catch (e) { console.error('[crm-finance] load', e) } finally { loading.value = false }
 }
 function loadMore() { loadRows(false) }
@@ -305,17 +328,24 @@ async function downloadBlob(res, fallbackName) {
 const modalOpen = ref(false)
 const editingId = ref(null)
 const formError = ref('')
-const form = reactive({ category: 'ad_spend', description: '', amount: null, vendor: '', expenseDate: new Date().toISOString().slice(0, 10), notes: '' })
+const form = reactive({ category: 'ad_spend', description: '', amount: null, vendor: '', expenseDate: new Date().toISOString().slice(0, 10), notes: '', currency: 'USD', fxRate: null, fxManual: false })
 
 function resetForm() {
-  Object.assign(form, { category: 'ad_spend', description: '', amount: null, vendor: '', expenseDate: new Date().toISOString().slice(0, 10), notes: '' })
+  Object.assign(form, { category: 'ad_spend', description: '', amount: null, vendor: '', expenseDate: new Date().toISOString().slice(0, 10), notes: '', currency: 'USD', fxRate: null, fxManual: false })
   formError.value = ''
 }
 function openNew() { resetForm(); editingId.value = null; modalOpen.value = true }
 function openEdit(r) {
   resetForm()
   editingId.value = r.id
-  Object.assign(form, { category: r.category, description: r.description || '', amount: Number(r.amount), vendor: r.vendor || '', expenseDate: r.expense_date, notes: r.notes || '' })
+  // A record entered in another currency reopens in that currency, at the rate it was saved with.
+  const fx = r.fx
+  Object.assign(form, {
+    category: r.category, description: r.description || '',
+    amount: fx?.original?.amount != null ? Number(fx.original.amount) : Number(r.amount),
+    vendor: r.vendor || '', expenseDate: r.expense_date, notes: r.notes || '',
+    currency: fx?.currency || 'USD', fxRate: fx?.rate ?? null, fxManual: !!fx?.manual
+  })
   modalOpen.value = true
 }
 function closeModal() { modalOpen.value = false }
@@ -431,4 +461,7 @@ onMounted(async () => {
 .fg { display: flex; flex-direction: column; gap: 5px; margin-bottom: 12px; }
 .fg label { font-size: 10.5px; font-weight: 700; letter-spacing: .5px; text-transform: uppercase; color: var(--crm-text-muted); }
 .modal-actions { display: flex; gap: 10px; margin-top: 16px; }
+.orig { font-size: 10.5px; font-weight: 500; color: var(--crm-text-muted); margin-top: 2px; }
+.who { font-size: 10.5px; color: var(--crm-text-dim); margin-top: 3px; font-weight: 500; }
+.btn-hist { padding: 7px 9px; margin-right: 6px; }
 </style>

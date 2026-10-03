@@ -64,3 +64,13 @@ admin-settings.json
 admin-sessions.json
 bypass-sessions.json
 *.bak-*
+fx-cache.json
+crm-user-sessions.json
+
+# Runtime state written by the app / cron (never commit)
+schedule-config.json
+daily-fetch-status.json
+employee-activity.log
+crm-deleted-message-ids.json
+.tokens
+*.pid
